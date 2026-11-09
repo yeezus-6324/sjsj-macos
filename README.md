@@ -10,7 +10,9 @@
 2. 打开 App，在窗口中的 4399 登录页面完成登录。
 3. 选择区服，等待客户端加载游戏资源并进入游戏。
 
-最低系统要求为 **macOS 12**。内置运行组件，无需另外安装 Adobe Flash Player 或 Rosetta 2。Intel Mac 未列入支持范围，macOS 28 及更高版本兼容性待验证。当前安装包未通过 Apple 公证，首次打开可能出现 Gatekeeper 提示。
+- **支持的机型与系统**：Apple Silicon Mac，macOS 12 或更高版本。Intel Mac 未列入支持范围。
+- **额外依赖**：无。Ruffle 已随 App 提供。Adobe Flash Player 和 Rosetta 2 都不需要安装。
+- **首次打开**：当前 DMG 未通过 Apple 公证，macOS 可能显示 Gatekeeper 提示。
 
 ## 客户端如何运行
 
