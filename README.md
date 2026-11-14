@@ -1,6 +1,6 @@
 # 神将世界 Mac 兼容工具
 
-[下载 2.0 安装 DMG](https://github.com/yeezus-6324/sjsj-macos/releases/download/v2.0/sjsj-macos-v2.0.dmg) · [下载独立卸载工具](https://github.com/yeezus-6324/sjsj-macos/releases/download/v2.0/sjsj-macos-uninstaller.zip) · [发布说明](https://github.com/yeezus-6324/sjsj-macos/releases/tag/v2.0)
+[下载 2.0.1 安装 DMG](https://github.com/yeezus-6324/sjsj-macos/releases/download/v2.0.1/sjsj-macos-v2.0.dmg) · [下载独立卸载工具](https://github.com/yeezus-6324/sjsj-macos/releases/download/v2.0.1/sjsj-macos-uninstaller.zip) · [发布说明](https://github.com/yeezus-6324/sjsj-macos/releases/tag/v2.0.1)
 
 v2.0 是面向 Apple Silicon Mac 的非官方兼容性研究项目。原生窗口通过 WebKit 打开 4399 官方登录页，游戏画面由 Ruffle WebAssembly 执行。应用内的 Python 桥接只监听本机回环地址，按会话转发允许的游戏资源与连接。游戏进度和房间状态由官方服务管理。
 
