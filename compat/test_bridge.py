@@ -42,6 +42,22 @@ class BridgeTests(unittest.TestCase):
         with urlopen(f'{self.local}/proxy/test/http/{HOST}{path}', timeout=40) as response:
             return response.read()
 
+    def test_runtime_mime_types_without_system_lookup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runtime = root / 'web-runtime'
+            runtime.mkdir()
+            for filename in ('ruffle.js', 'core.wasm'):
+                (runtime / filename).write_bytes(b'fixture')
+            with patch.object(bridge, 'ROOT', root):
+                for filename, content_type in (
+                    ('ruffle.js', 'text/javascript'),
+                    ('core.wasm', 'application/wasm'),
+                ):
+                    with urlopen(f'{self.local}/runtime/{filename}', timeout=5) as response:
+                        self.assertEqual(response.headers.get_content_type(), content_type)
+                        self.assertEqual(response.read(), b'fixture')
+
     def test_all_former_patch_routes_are_passthrough(self):
         paths = (
             '/www_sjsj/main_2_379_0_143824.swf',

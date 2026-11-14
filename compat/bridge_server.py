@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Loopback-only game adapter for unmodified official resources. Official authentication remains in the login webview."""
-import base64, hashlib, json, mimetypes, os, re, secrets, select, socket, struct, sys, threading, time
+import base64, hashlib, json, os, re, secrets, select, socket, struct, sys, threading, time
 from collections import OrderedDict, deque
 from contextlib import closing
 sys.path.insert(0,str(__import__("pathlib").Path(__file__).resolve().parent))
@@ -12,6 +12,12 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import NamedTuple, Optional
 ROOT=Path(__file__).resolve().parent
+RUNTIME_CONTENT_TYPES = {
+ '.js': 'text/javascript; charset=utf-8',
+ '.wasm': 'application/wasm',
+ '.json': 'application/json',
+ '.map': 'application/json',
+}
 KEY=os.environ['SJSJ_BRIDGE_KEY']
 SESSIONS={}; EVENTS=[]; CRITICAL_EVENTS=[]; LOCK=threading.Lock(); CACHE=OrderedDict()
 RESOURCE_CACHE_BYTES = 96 * 1024 * 1024
@@ -375,7 +381,8 @@ class Handler(BaseHTTPRequestHandler):
   if parts[1]=='runtime':
    rel='/'.join(parts[2:]);p=(ROOT/'web-runtime'/rel).resolve();base=(ROOT/'web-runtime').resolve()
    if base not in p.parents or not p.is_file():return self.response(404,'Not found')
-   ct='application/wasm' if p.suffix=='.wasm' else mimetypes.guess_type(str(p))[0] or 'application/octet-stream'
+   # Python's system MIME lookup can try to read files outside the app sandbox.
+   ct=RUNTIME_CONTENT_TYPES.get(p.suffix, 'application/octet-stream')
    return self.response(200,p.read_bytes(),ct)
   return self.response(404,'Not found')
  def websocket(self,host,port):
