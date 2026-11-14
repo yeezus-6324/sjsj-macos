@@ -1,0 +1,4192 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 6379920..2dc30cb 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4795,6 +4795,7 @@ dependencies = [
+  "flv-rs",
+  "fnv",
+  "futures",
++ "futures-util",
+  "gc-arena",
+  "hashbrown 0.17.1",
+  "id3",
+diff --git a/core/Cargo.toml b/core/Cargo.toml
+index c0fafc3..a7aacd8 100644
+--- a/core/Cargo.toml
++++ b/core/Cargo.toml
+@@ -48,7 +48,7 @@ lzma-rs = { workspace = true, optional = true }
+ dasp = { version = "0.11.0", features = ["interpolate", "interpolate-linear", "signal"], optional = true }
+ symphonia = { version = "0.5.5", default-features = false, optional = true }
+ enumset = "1.1.13"
+-bytemuck = { workspace = true, features = ["derive"] }
++bytemuck = { workspace = true, features = ["derive", "extern_crate_alloc"] }
+ clap = { workspace = true, optional=true }
+ realfft = "3.5.0"
+ hashbrown = { workspace = true }
+@@ -70,6 +70,7 @@ either = "1.16.0"
+ chardetng = "0.1.17"
+ tracy-client = { version = "0.18.4", optional = true, default-features = false }
+ itertools = "0.14.0"
++futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
+ 
+ [target.'cfg(not(target_family = "wasm"))'.dependencies.futures]
+ workspace = true
+diff --git a/core/common/src/avm_string/repr.rs b/core/common/src/avm_string/repr.rs
+index 34e2368..1c1415c 100644
+--- a/core/common/src/avm_string/repr.rs
++++ b/core/common/src/avm_string/repr.rs
+@@ -1,5 +1,5 @@
+ use gc_arena::{Collect, Gc};
+-use ruffle_wstr::{WStr, WString, panic_on_invalid_length, ptr as wptr, wstr_impl_traits};
++use ruffle_wstr::{Units, WStr, WString, panic_on_invalid_length, ptr as wptr, wstr_impl_traits};
+ use std::cell::Cell;
+ use std::ops::Deref;
+ 
+@@ -75,9 +75,8 @@ impl<'gc> AvmStringRepr<'gc> {
+     }
+ 
+     pub fn try_append_inline(left: Gc<'gc, Self>, right: &WStr) -> Option<Self> {
+-        // note: we could also in-place append a byte string to a wide string
+-        // But it was skipped for now.
+-        if left.is_wide() != right.is_wide() {
++        // A narrow destination cannot hold wide code units without reallocating.
++        if !left.is_wide() && right.is_wide() {
+             return None;
+         }
+ 
+@@ -121,8 +120,22 @@ impl<'gc> AvmStringRepr<'gc> {
+             }
+             if chars_available >= right.len() {
+                 let first_available = first_available as *mut u8;
+-                let right_ptr = right as *const WStr as *const () as *const u8;
+-                std::ptr::copy_nonoverlapping(right_ptr, first_available, char_size * right.len());
++                if left.is_wide()
++                    && let Units::Bytes(bytes) = right.units()
++                {
++                    // Initialize the unused tail without modifying any existing string view.
++                    let tail = first_available.cast::<u16>();
++                    for (offset, byte) in bytes.iter().copied().enumerate() {
++                        tail.add(offset).write(u16::from(byte));
++                    }
++                } else {
++                    let right_ptr = right as *const WStr as *const () as *const u8;
++                    std::ptr::copy_nonoverlapping(
++                        right_ptr,
++                        first_available,
++                        char_size * right.len(),
++                    );
++                }
+ 
+                 let new_chars_used: usize = left_origin.chars_used.get() as usize + right.len();
+                 if new_chars_used >= u32::MAX as usize {
+diff --git a/core/common/src/tag_utils.rs b/core/common/src/tag_utils.rs
+index 739529e..22ca001 100644
+--- a/core/common/src/tag_utils.rs
++++ b/core/common/src/tag_utils.rs
+@@ -317,6 +317,23 @@ impl SwfMovieData {
+         &self.data
+     }
+ 
++    /// Share identical decompressed data without changing the identity or metadata of the movie.
++    pub fn share_data(&mut self, pool: &mut Vec<std::sync::Weak<Vec<u8>>>) {
++        pool.retain(|entry| entry.strong_count() > 0);
++        for entry in pool.iter().rev() {
++            if let Some(data) = entry.upgrade()
++                && data.as_slice() == self.data.as_slice()
++            {
++                self.data = data;
++                return;
++            }
++        }
++        if pool.len() == 256 {
++            pool.remove(0);
++        }
++        pool.push(Arc::downgrade(&self.data));
++    }
++
+     /// Returns the suggested string encoding for the given SWF version.
+     /// For SWF version 6 and higher, this is always UTF-8.
+     /// For SWF version 5 and lower, this is locale-dependent,
+diff --git a/core/src/avm1/globals/sound.rs b/core/src/avm1/globals/sound.rs
+index baab6a1..5108a13 100644
+--- a/core/src/avm1/globals/sound.rs
++++ b/core/src/avm1/globals/sound.rs
+@@ -461,7 +461,7 @@ fn attach_sound<'gc>(
+         if let Some((_, Character::Sound(sound_handle))) = activation
+             .context
+             .library
+-            .library_for_movie_mut(movie)
++            .library_for_movie_mut(movie, activation.gc())
+             .character_by_export_name(&name)
+         {
+             sound.set_sound(activation, this, Some(sound_handle));
+@@ -883,7 +883,7 @@ fn stop<'gc>(
+             if let Some((_, Character::Sound(sound))) = activation
+                 .context
+                 .library
+-                .library_for_movie_mut(movie)
++                .library_for_movie_mut(movie, activation.gc())
+                 .character_by_export_name(&name)
+             {
+                 // FIXME: This isn't entirely correct. We should only
+diff --git a/core/src/avm1/globals.rs b/core/src/avm1/globals.rs
+index bc16674..7c4295b 100644
+--- a/core/src/avm1/globals.rs
++++ b/core/src/avm1/globals.rs
+@@ -9,7 +9,7 @@ use crate::string::{AvmString, StringContext, WStr, WString};
+ use crate::tag_utils;
+ use crate::tag_utils::ControlFlow;
+ use gc_arena::Collect;
+-use ruffle_common::tag_utils::{SwfMovie, SwfMovieData, SwfSlice, SwfStream};
++use crate::tag_utils::{SwfMovie, SwfMovieData, SwfSlice, SwfStream};
+ use std::str;
+ use swf::TagCode;
+ 
+diff --git a/core/src/avm2/amf.rs b/core/src/avm2/amf.rs
+index 783834c..b8c5e6b 100644
+--- a/core/src/avm2/amf.rs
++++ b/core/src/avm2/amf.rs
+@@ -4,7 +4,7 @@ use std::rc::Rc;
+ use crate::avm2::ArrayStorage;
+ use crate::avm2::bytearray::ByteArrayStorage;
+ use crate::avm2::class::Class;
+-use crate::avm2::index::ArrayIndex;
++use crate::avm2::index::{ArrayIndex, parse_u32_index};
+ use crate::avm2::object::{
+     ArrayObject, ByteArrayObject, ClassObject, ScriptObject, TObject, VectorObject,
+ };
+@@ -12,7 +12,7 @@ use crate::avm2::property::Property;
+ use crate::avm2::vector::VectorStorage;
+ use crate::avm2::{Activation, Error, Object, Value};
+ use crate::avm2_stub_method;
+-use crate::string::AvmString;
++use crate::string::{AvmString, WStr};
+ use enumset::EnumSet;
+ use flash_lso::types::{AMFVersion, Element, Lso, ObjectId};
+ use flash_lso::types::{Attribute, ClassDefinition, Value as AmfValue};
+@@ -208,10 +208,34 @@ pub fn recursive_serialize<'gc>(
+     if let Some(static_properties) = static_properties {
+         let vtable = obj.vtable();
+         // TODO: respect versioning
+-        // Flash appears to use vtable iteration order, but we sort ours
+-        // to make our test output consistent.
+         let mut props = vtable.public_properties().collect::<Vec<_>>();
+-        props.sort_by_key(|(name, _)| *name);
++        if amf_version == AMFVersion::AMF3 {
++            // Flash writes traits from derived classes before inherited traits.
++            // This order is observable when a derived setter changes a base
++            // slot while the object is being deserialized. Preserve the existing
++            // deterministic ordering within each class until Flash's vtable
++            // iteration order is emulated.
++            let mut declaring_depth = FnvHashMap::default();
++            for (depth, class) in
++                std::iter::successors(Some(obj.instance_class()), |class| class.super_class())
++                    .enumerate()
++            {
++                for property in class.traits() {
++                    let name = property.name();
++                    if name.namespace().is_public() {
++                        declaring_depth.entry(name.local_name()).or_insert(depth);
++                    }
++                }
++            }
++            props.sort_by_key(|(name, _)| {
++                (
++                    declaring_depth.get(name).copied().unwrap_or(usize::MAX),
++                    *name,
++                )
++            });
++        } else {
++            props.sort_by_key(|(name, _)| *name);
++        }
+ 
+         for (name, prop) in props {
+             if let Property::Method { .. } = prop {
+@@ -303,6 +327,38 @@ fn get_or_create_value<'gc>(
+     }
+ }
+ 
++/// Identify anonymous configuration records with sequential numeric object
++/// rows and textual named metadata. Keep metadata enumerable, but out of the
++/// row bucket layout so it cannot shuffle the order of the numeric records.
++fn is_numbered_record(elements: &[Element]) -> bool {
++    let mut row_count = 0;
++    let mut has_metadata = false;
++    let mut first = u32::MAX;
++    let mut last = 0;
++
++    for entry in elements {
++        if let Some(index) =
++            parse_u32_index(WStr::from_units(entry.name().as_bytes()), (1 << 28) - 1)
++        {
++            if !matches!(
++                entry.value(),
++                AmfValue::Object(..) | AmfValue::Amf3ObjectReference(_)
++            ) {
++                return false;
++            }
++            first = first.min(index);
++            last = last.max(index);
++            row_count += 1;
++        } else if matches!(entry.value(), AmfValue::String(_)) {
++            has_metadata = true;
++        } else {
++            return false;
++        }
++    }
++
++    has_metadata && first <= 1 && (last - first + 1) as usize == row_count
++}
++
+ /// Deserialize a AmfValue to a Value
+ pub fn deserialize_value<'gc>(
+     activation: &mut Activation<'_, 'gc>,
+@@ -386,7 +442,20 @@ pub fn deserialize_value_impl<'gc>(
+                 activation.avm2().classes().object
+             };
+             let obj = target_class.construct(activation, &[])?;
+-            object_map.insert(*id, obj.as_object().unwrap());
++            let object = obj.as_object().unwrap();
++            object_map.insert(*id, object);
++
++            if target_class == activation.avm2().classes().object
++                && class.as_ref().is_some_and(|class| {
++                    class.name.is_empty() && class.attributes.contains(Attribute::Dynamic)
++                })
++                && is_numbered_record(elements)
++            {
++                object
++                    .base()
++                    .values_mut(activation.gc())
++                    .use_numbered_record_enumeration();
++            }
+ 
+             for entry in elements {
+                 let name = entry.name();
+diff --git a/core/src/avm2/class.rs b/core/src/avm2/class.rs
+index 438da11..f4c3e45 100644
+--- a/core/src/avm2/class.rs
++++ b/core/src/avm2/class.rs
+@@ -18,6 +18,8 @@ use crate::avm2::value::Value;
+ use crate::avm2::vtable::{VTable, VTableInitError};
+ use crate::context::UpdateContext;
+ use crate::string::{AvmString, WString};
++use crate::tag_utils::SwfMovie;
++use swf::CharacterId;
+ use bitflags::bitflags;
+ use fnv::FnvHashMap;
+ use gc_arena::barrier::unlock;
+@@ -105,6 +107,7 @@ pub struct Class<'gc>(Gc<'gc, ClassData<'gc>>);
+ #[derive(Collect)]
+ #[collect(no_drop)]
+ pub struct ClassData<'gc> {
++    library_symbol: Lock<Option<(SwfMovie<'gc>, CharacterId)>>,
+     /// The name of the class.
+     name: Lock<QName<'gc>>,
+ 
+@@ -219,6 +222,7 @@ impl<'gc> ClassData<'gc> {
+     fn empty(name: QName<'gc>) -> Self {
+         Self {
+             name: Lock::new(name),
++            library_symbol: Lock::new(None),
+             param: Lock::new(None),
+             super_class: None,
+             attributes: Cell::new(ClassAttributes::empty()),
+@@ -242,6 +246,35 @@ impl<'gc> ClassData<'gc> {
+ }
+ 
+ impl<'gc> Class<'gc> {
++    pub fn library_symbol(self) -> Option<(SwfMovie<'gc>, CharacterId)> {
++        self.0.library_symbol.get()
++    }
++
++    pub fn set_library_symbol(self, mc: &Mutation<'gc>, movie: SwfMovie<'gc>, symbol: CharacterId) {
++        if let Some(old) = self.library_symbol() {
++            if SwfMovie::ptr_eq(&movie, &old.0) && symbol != old.1 {
++                // Flash player actually allows using the same class in multiple SymbolClass
++                // entries in the same swf, with *different* symbol ids. Whichever one
++                // is processed first will *win*, and the second one will be ignored.
++                // We still log a warning, since we wouldn't expect this to happen outside
++                // of deliberately crafted SWFs.
++                tracing::warn!(
++                    "Tried to overwrite class {:?} id={:?} with symbol id={:?} from same movie",
++                    self,
++                    old.1,
++                    symbol,
++                );
++            }
++            // If we're trying to overwrite the class with a symbol from a *different* SwfMovie,
++            // then just ignore it. This handles the case where a Loader has a class that shadows
++            // a class in the main swf (possibly with a different ApplicationDomain). This will
++            // result in the original class from the parent being used, even when the child swf
++            // instantiates the clip on the timeline.
++            return;
++        }
++        unlock!(Gc::write(mc, self.0), ClassData, library_symbol).set(Some((movie, symbol)));
++    }
++
+     pub fn as_ptr(self) -> *const () {
+         Gc::as_ptr(self.0).cast()
+     }
+diff --git a/core/src/avm2/dynamic_map.rs b/core/src/avm2/dynamic_map.rs
+index 6a0c92a..1bba52f 100644
+--- a/core/src/avm2/dynamic_map.rs
++++ b/core/src/avm2/dynamic_map.rs
+@@ -26,6 +26,105 @@ pub enum DynamicKey<'gc> {
+     Object(Object<'gc>),
+ }
+ 
++/// Keys represented as unsigned integer atoms have a predictable placement in
++/// Flash's dynamic property table. Reference-backed keys depend on object
++/// addresses, so keep the ordinary enumeration for tables containing those.
++pub trait NumericAtomKey: Sized {
++    fn numeric_atom(&self) -> Option<u32>;
++    fn from_numeric_atom(index: u32) -> Self;
++}
++
++impl NumericAtomKey for DynamicKey<'_> {
++    fn numeric_atom(&self) -> Option<u32> {
++        match self {
++            Self::Uint(index) => Some(*index),
++            _ => None,
++        }
++    }
++
++    fn from_numeric_atom(index: u32) -> Self {
++        Self::Uint(index)
++    }
++}
++
++#[derive(Debug, Clone, Copy)]
++enum NumericBucket {
++    Empty,
++    Deleted,
++    Key(u32),
++}
++
++#[derive(Debug, Clone)]
++struct NumericBuckets {
++    buckets: Vec<NumericBucket>,
++    occupied: usize,
++    deleted: usize,
++}
++
++impl NumericBuckets {
++    fn new() -> Self {
++        Self {
++            buckets: vec![NumericBucket::Empty; 2],
++            occupied: 0,
++            deleted: 0,
++        }
++    }
++
++    fn find(&self, key: u32) -> usize {
++        let mask = self.buckets.len() - 1;
++        let mut index = (key & 0x0fff_ffff) as usize & mask;
++        // Successive probes use increasing displacements starting at eight.
++        for displacement in 8.. {
++            match self.buckets[index] {
++                NumericBucket::Empty => break,
++                NumericBucket::Key(stored) if stored == key => break,
++                _ => index = (index + displacement) & mask,
++            }
++        }
++        index
++    }
++
++    fn insert(&mut self, key: u32) {
++        let index = self.find(key);
++        self.buckets[index] = NumericBucket::Key(key);
++        // Flash rehashes at this load factor, reclaiming tombstones before
++        // increasing capacity. Reinsert in old bucket order.
++        self.occupied += 1;
++        if 5 * (self.occupied + 1) >= 4 * self.buckets.len() {
++            let capacity = if self.deleted == 0 {
++                self.buckets.len() * 2
++            } else {
++                self.buckets.len()
++            };
++            let old = std::mem::replace(&mut self.buckets, vec![NumericBucket::Empty; capacity]);
++            self.occupied -= self.deleted;
++            self.deleted = 0;
++            for bucket in old {
++                if let NumericBucket::Key(key) = bucket {
++                    let index = self.find(key);
++                    self.buckets[index] = bucket;
++                }
++            }
++        }
++    }
++
++    fn remove(&mut self, key: u32) {
++        let index = self.find(key);
++        debug_assert!(matches!(self.buckets[index], NumericBucket::Key(stored) if stored == key));
++        self.buckets[index] = NumericBucket::Deleted;
++        self.deleted += 1;
++    }
++}
++
++#[derive(Debug, Clone, Default)]
++enum EnumerationBuckets {
++    #[default]
++    Empty,
++    Numeric(Box<NumericBuckets>),
++    NumberedRecord(Box<NumericBuckets>),
++    General,
++}
++
+ /// A HashMap designed for dynamic properties on an object.
+ ///
+ /// Uses `HashTable` directly to expose stable bucket indices, which are
+@@ -36,6 +135,8 @@ pub struct DynamicMap<K, V> {
+     table: HashTable<(K, DynamicProperty<V>)>,
+     #[collect(require_static)]
+     hasher: FnvBuildHasher,
++    #[collect(require_static)]
++    enumeration: EnumerationBuckets,
+     // The last index that was given back to flash
+     #[collect(require_static)]
+     public_index: Cell<usize>,
+@@ -44,13 +145,13 @@ pub struct DynamicMap<K, V> {
+     real_index: Cell<usize>,
+ }
+ 
+-impl<K: Eq + Hash, V> Default for DynamicMap<K, V> {
++impl<K: Eq + Hash + NumericAtomKey, V> Default for DynamicMap<K, V> {
+     fn default() -> Self {
+         Self::new()
+     }
+ }
+ 
+-impl<K: Eq + Hash, V> DynamicMap<K, V> {
++impl<K: Eq + Hash + NumericAtomKey, V> DynamicMap<K, V> {
+     fn hash_key(&self, key: &K) -> u64 {
+         self.hasher.hash_one(key)
+     }
+@@ -59,6 +160,7 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
+         Self {
+             table: HashTable::new(),
+             hasher: FnvBuildHasher::default(),
++            enumeration: EnumerationBuckets::Empty,
+             public_index: Cell::new(0),
+             real_index: Cell::new(0),
+         }
+@@ -92,14 +194,53 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
+         self.table.is_empty()
+     }
+ 
++    /// Keep the row order of a numbered AMF record independent of its text
++    /// metadata. Call before inserting any fields into the record.
++    pub fn use_numbered_record_enumeration(&mut self) {
++        debug_assert!(self.table.is_empty());
++        self.enumeration = EnumerationBuckets::NumberedRecord(Box::new(NumericBuckets::new()));
++    }
++
++    fn enumeration_len(&self) -> usize {
++        match &self.enumeration {
++            EnumerationBuckets::Numeric(numeric) => numeric.buckets.len(),
++            EnumerationBuckets::NumberedRecord(numeric) => {
++                numeric.buckets.len() + self.table.num_buckets()
++            }
++            _ => self.table.num_buckets(),
++        }
++    }
++
++    fn enumeration_bucket(&self, index: usize) -> Option<&(K, DynamicProperty<V>)> {
++        let numeric = match &self.enumeration {
++            EnumerationBuckets::Numeric(numeric) => numeric,
++            EnumerationBuckets::NumberedRecord(numeric) => {
++                if let Some(named_index) = index.checked_sub(numeric.buckets.len()) {
++                    return self
++                        .table
++                        .get_bucket(named_index)
++                        .filter(|(key, _)| key.numeric_atom().is_none());
++                }
++                numeric
++            }
++            _ => return self.table.get_bucket(index),
++        };
++
++        let NumericBucket::Key(key) = *numeric.buckets.get(index)? else {
++            return None;
++        };
++        let key = K::from_numeric_atom(key);
++        self.table.find(self.hash_key(&key), |(k, _)| *k == key)
++    }
++
+     /// Gets the bucket index from the current public index.
+     /// Returns `None` if the index is out of bounds.
+     fn public_to_real_index(&self, index: usize) -> Option<usize> {
+         let mut count = 0;
+-        let num_buckets = self.table.num_buckets();
++        let num_buckets = self.enumeration_len();
+ 
+         for i in 0..num_buckets {
+-            if let Some((_, v)) = self.table.get_bucket(i)
++            if let Some((_, v)) = self.enumeration_bucket(i)
+                 && v.enumerable
+             {
+                 count += 1;
+@@ -115,6 +256,7 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
+ 
+     pub fn insert(&mut self, key: K, new_value: V) {
+         let hash = self.hash_key(&key);
++        let numeric_key = key.numeric_atom();
+ 
+         match self
+             .table
+@@ -133,6 +275,28 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
+                         enumerable: true,
+                     },
+                 ));
++                match (&mut self.enumeration, numeric_key) {
++                    (EnumerationBuckets::Empty, Some(key)) => {
++                        let mut buckets = NumericBuckets::new();
++                        buckets.insert(key);
++                        self.enumeration = EnumerationBuckets::Numeric(Box::new(buckets));
++                    }
++                    (
++                        EnumerationBuckets::Numeric(buckets)
++                        | EnumerationBuckets::NumberedRecord(buckets),
++                        Some(key),
++                    ) => {
++                        buckets.insert(key);
++                    }
++                    (EnumerationBuckets::Numeric(_), None) => {
++                        self.enumeration = EnumerationBuckets::General;
++                        self.public_index.set(0);
++                    }
++                    (EnumerationBuckets::Empty, None) => {
++                        self.enumeration = EnumerationBuckets::General;
++                    }
++                    _ => {}
++                }
+             }
+         }
+     }
+@@ -141,7 +305,17 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
+         let hash = self.hash_key(key);
+ 
+         match self.table.find_entry(hash, |(k, _)| k == key) {
+-            Ok(occupied) => Some(occupied.remove().0.1),
++            Ok(occupied) => {
++                if let (
++                    EnumerationBuckets::Numeric(buckets)
++                    | EnumerationBuckets::NumberedRecord(buckets),
++                    Some(index),
++                ) = (&mut self.enumeration, key.numeric_atom())
++                {
++                    buckets.remove(index);
++                }
++                Some(occupied.remove().0.1)
++            }
+             Err(_) => None,
+         }
+     }
+@@ -184,11 +358,11 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
+         }
+ 
+         let real = self.real_index.get() + 1;
+-        let num_buckets = self.table.num_buckets();
++        let num_buckets = self.enumeration_len();
+ 
+         if !self.table.is_empty() && real < num_buckets {
+             for i in real..num_buckets {
+-                if let Some((_, v)) = self.table.get_bucket(i)
++                if let Some((_, v)) = self.enumeration_bucket(i)
+                     && v.enumerable
+                 {
+                     self.real_index.set(i);
+@@ -208,7 +382,7 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
+             self.real_index.get()
+         };
+ 
+-        self.table.get_bucket(real_index)
++        self.enumeration_bucket(real_index)
+     }
+ 
+     pub fn key_at(&self, index: usize) -> Option<&K> {
+@@ -231,7 +405,32 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
+ #[cfg(test)]
+ mod tests {
+ 
+-    use super::DynamicMap;
++    use super::{DynamicKey, DynamicMap, NumericAtomKey};
++
++    impl NumericAtomKey for &str {
++        fn numeric_atom(&self) -> Option<u32> {
++            None
++        }
++
++        fn from_numeric_atom(_index: u32) -> Self {
++            unreachable!()
++        }
++    }
++
++    #[test]
++    fn numeric_buckets_follow_flash_probe_order() {
++        let mut map = DynamicMap::new();
++        for key in [5, 2, 13, 1, 8, 19, 3, 23, 11] {
++            map.insert(DynamicKey::Uint(key), key);
++        }
++        let mut current = 0;
++        let mut values = Vec::new();
++        while let Some(next) = map.next(current) {
++            values.push(*map.value_at(next).unwrap());
++            current = next;
++        }
++        assert_eq!(values, [1, 2, 19, 5, 23, 8, 3, 11, 13]);
++    }
+ 
+     #[test]
+     fn test_dynamic_map() {
+diff --git a/core/src/avm2/error.rs b/core/src/avm2/error.rs
+index dda26b5..32d72fa 100644
+--- a/core/src/avm2/error.rs
++++ b/core/src/avm2/error.rs
+@@ -1081,6 +1081,7 @@ pub fn make_error_2027<'gc>(
+     ))
+ }
+ 
++make_error_fn!(make_error_2029, 2029, error);
+ make_error_fn!(make_error_2030, 2030, eof_error);
+ make_error_fn!(make_error_2037, 2037, error);
+ make_error_fn!(make_error_2058, 2058, io_error);
+diff --git a/core/src/avm2/globals/date.rs b/core/src/avm2/globals/date.rs
+index ef347ea..58f9db6 100644
+--- a/core/src/avm2/globals/date.rs
++++ b/core/src/avm2/globals/date.rs
+@@ -1047,6 +1047,7 @@ pub fn to_date_string<'gc>(
+ }
+ 
+ /// Parse a date, in any of the three formats: YYYY/MM/DD, MM/DD/YYYY, Mon/DD/YYYY.
++/// Numeric month and day components may omit their leading zero.
+ /// The output will always be: (year, month, day), or None if format is invalid.
+ fn parse_date(item: &WStr) -> Option<(u32, u32, u32)> {
+     let mut iter = item.split(b'/');
+@@ -1054,11 +1055,11 @@ fn parse_date(item: &WStr) -> Option<(u32, u32, u32)> {
+     let parsed = if first.len() == 4 {
+         // If the first item in this date is 4 characters long, we parse as YYYY/MM/DD
+         let month = iter.next()?;
+-        if month.len() != 2 {
++        if !(1..=2).contains(&month.len()) {
+             return None;
+         }
+         let day = iter.next()?;
+-        if day.len() != 2 {
++        if !(1..=2).contains(&day.len()) {
+             return None;
+         }
+         (
+@@ -1066,10 +1067,10 @@ fn parse_date(item: &WStr) -> Option<(u32, u32, u32)> {
+             month.parse::<u32>().ok()?.checked_sub(1)?,
+             day.parse::<u32>().ok()?,
+         )
+-    } else if first.len() == 2 {
+-        // If the first item in this date is 2 characters long, we parse as MM/DD/YYYY
++    } else if (1..=2).contains(&first.len()) {
++        // A one- or two-digit first component is the month in MM/DD/YYYY.
+         let day = iter.next()?;
+-        if day.len() != 2 {
++        if !(1..=2).contains(&day.len()) {
+             return None;
+         }
+         let year = iter.next()?;
+@@ -1087,7 +1088,7 @@ fn parse_date(item: &WStr) -> Option<(u32, u32, u32)> {
+         // First lets parse the Month
+         let month = parse_mon(first)?;
+         let day = iter.next()?;
+-        if day.len() != 2 {
++        if !(1..=2).contains(&day.len()) {
+             return None;
+         }
+         let year = iter.next()?;
+@@ -1118,19 +1119,19 @@ fn parse_mon(item: &WStr) -> Option<usize> {
+     MONTHS.iter().position(|&x| x == item)
+ }
+ 
+-/// Parses HH:MM:SS. The output is always (hours, minutes, seconds), or None if format was invalid.
++/// Parses HH:MM:SS with optional leading zeroes. The output is always (hours, minutes, seconds), or None if format was invalid.
+ fn parse_hms(item: &WStr) -> Option<(u32, u32, u32)> {
+     let mut iter = item.split(b':');
+     let hours = iter.next()?;
+-    if hours.len() != 2 {
++    if !(1..=2).contains(&hours.len()) {
+         return None;
+     }
+     let minutes = iter.next()?;
+-    if minutes.len() != 2 {
++    if !(1..=2).contains(&minutes.len()) {
+         return None;
+     }
+     let seconds = iter.next()?;
+-    if seconds.len() != 2 {
++    if !(1..=2).contains(&seconds.len()) {
+         return None;
+     }
+     if iter.next().is_some() {
+diff --git a/core/src/avm2/globals/flash/display/Loader.as b/core/src/avm2/globals/flash/display/Loader.as
+index 0cafdf0..818a1c3 100644
+--- a/core/src/avm2/globals/flash/display/Loader.as
++++ b/core/src/avm2/globals/flash/display/Loader.as
+@@ -35,9 +35,7 @@ package flash.display {
+             this.unload();
+         }
+ 
+-        public function close():void {
+-            stub_method("flash.display.Loader", "close");
+-        }
++        public native function close():void;
+ 
+         override public function addChild(child:DisplayObject):DisplayObject {
+             throw new IllegalOperationError("Error #2069: The Loader class does not implement this method.", 2069);
+diff --git a/core/src/avm2/globals/flash/display/bitmap.rs b/core/src/avm2/globals/flash/display/bitmap.rs
+index 569f987..87670e9 100644
+--- a/core/src/avm2/globals/flash/display/bitmap.rs
++++ b/core/src/avm2/globals/flash/display/bitmap.rs
+@@ -40,18 +40,14 @@ pub fn bitmap_allocator<'gc>(
+             );
+         }
+ 
+-        if let Some((movie, symbol)) = activation
+-            .context
+-            .library
+-            .avm2_class_registry()
+-            .class_symbol(class)
++        if let Some((movie, symbol)) = class.library_symbol()
+             && let Some(Character::Bitmap(bitmap)) = activation
+                 .context
+                 .library
+-                .library_for_movie_mut(movie)
++                .library_for_movie_mut(movie, activation.gc())
+                 .character_by_id(symbol)
+         {
+-            let new_bitmap_data = fill_bitmap_data_from_symbol(activation, bitmap.compressed());
++            let new_bitmap_data = fill_bitmap_data_from_symbol(activation, &bitmap, orig_class.name())?;
+             let bitmap_data_obj =
+                 BitmapDataObject::from_bitmap_data(activation.context, new_bitmap_data);
+             new_bitmap_data.init_object2(activation.gc(), bitmap_data_obj);
+diff --git a/core/src/avm2/globals/flash/display/bitmap_data.rs b/core/src/avm2/globals/flash/display/bitmap_data.rs
+index 6815b73..8e488e8 100644
+--- a/core/src/avm2/globals/flash/display/bitmap_data.rs
++++ b/core/src/avm2/globals/flash/display/bitmap_data.rs
+@@ -21,10 +21,10 @@ use crate::avm2::parameters::ParametersExt;
+ use crate::avm2::value::Value;
+ use crate::avm2::vector::VectorStorage;
+ use crate::avm2_stub_method;
+-use crate::bitmap::bitmap_data::{BitmapData, ChannelOptions, ThresholdOperation};
++use crate::bitmap::bitmap_data::{BitmapData, BitmapPixels, ChannelOptions, Color, ThresholdOperation};
+ use crate::bitmap::bitmap_data::{BitmapDataDrawError, IBitmapDrawable};
+ use crate::bitmap::{is_size_valid, operations};
+-use crate::character::{Character, CompressedBitmap};
++use crate::character::{BitmapCharacter, Character};
+ use crate::ecma_conversions::round_to_even;
+ use crate::swf::BlendMode;
+ use ruffle_render::filters::Filter;
+@@ -72,19 +72,68 @@ fn get_rectangle_x_y_width_height<'gc>(
+ /// class named by `name`.
+ pub fn fill_bitmap_data_from_symbol<'gc>(
+     activation: &mut Activation<'_, 'gc>,
+-    bd: &CompressedBitmap,
+-) -> BitmapData<'gc> {
+-    let bitmap = bd.decode().expect("Failed to decode BitmapData");
+-    BitmapData::new_with_pixels(
+-        activation.context.gc_context,
+-        bitmap.width(),
+-        bitmap.height(),
+-        true,
+-        bitmap
+-            .as_colors()
+-            .map(crate::bitmap::bitmap_data::Color::from)
+-            .collect(),
+-    )
++    symbol: &BitmapCharacter<'gc>,
++    class: crate::avm2::QName<'gc>,
++) -> Result<BitmapData<'gc>, Error<'gc>> {
++    let (size, pixels) = if let Some(existing) = symbol.avm2_pixels() {
++        existing
++    } else {
++        let (size, pixels) = decode_bitmap_data_from_symbol(activation, symbol, class)?;
++        symbol.remember_avm2_pixels(size, &pixels);
++        (size, pixels)
++    };
++    let bitmap = BitmapData::new_with_shared_pixels(activation.gc(), size.width, size.height, pixels);
++    if let Some(candidate) = bitmap.cold_pixel_candidate() {
++        activation.context.library.track_cold_bitmap(candidate);
++    }
++    Ok(bitmap)
++}
++
++fn decode_bitmap_data_from_symbol<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    symbol: &BitmapCharacter<'gc>,
++    class: crate::avm2::QName<'gc>,
++) -> Result<(ruffle_render::bitmap::BitmapSize, BitmapPixels), Error<'gc>> {
++    let bitmap = symbol.compressed().decode().map_err(|error| {
++        tracing::error!("Failed to decode embedded BitmapData: {error}");
++        make_error_2015(activation)
++    })?;
++    let (width, height) = (bitmap.width(), bitmap.height());
++    let format = bitmap.format();
++    let mut bytes = bitmap.into_buf().into_owned();
++    if format == ruffle_render::bitmap::BitmapFormat::Rgb {
++        let pixels = bytes.len() / 3;
++        bytes.try_reserve_exact(pixels).map_err(|error| {
++            tracing::error!("Failed to expand embedded BitmapData ({width}x{height}): {error}");
++            make_error_2015(activation)
++        })?;
++        bytes.resize(pixels * 4, 0);
++        for index in (0..pixels).rev() {
++            let from = index * 3;
++            let to = index * 4;
++            let rgba = [bytes[from], bytes[from + 1], bytes[from + 2], 255];
++            bytes[to..to + 4].copy_from_slice(&rgba);
++        }
++    } else {
++        debug_assert_eq!(format, ruffle_render::bitmap::BitmapFormat::Rgba);
++    }
++    // Color is four byte-aligned RGBA channels. The allocator layout matches
++    // once the byte vector capacity is divisible by the size of one pixel.
++    let pixels = match bytemuck::allocation::try_cast_vec::<u8, Color>(bytes) {
++        Ok(pixels) => pixels,
++        Err((_, bytes)) => {
++            let mut pixels = Vec::new();
++            pixels.try_reserve_exact(bytes.len() / 4).map_err(|error| {
++                tracing::error!("Failed to allocate embedded BitmapData ({width}x{height}): {error}");
++                make_error_2015(activation)
++            })?;
++            pixels.extend_from_slice(bytemuck::cast_slice(&bytes));
++            pixels
++        }
++    };
++    let pixels = BitmapPixels::from_embedded(pixels);
++    pixels.record_embedded_class(class);
++    Ok((ruffle_render::bitmap::BitmapSize { width, height }, pixels))
+ }
+ 
+ /// Implements `flash.display.BitmapData`'s 'init' method (invoked from the AS3 constructor)
+@@ -99,22 +148,18 @@ pub fn init<'gc>(
+     // We set the underlying BitmapData instance - we start out with a dummy BitmapData,
+     // which makes custom classes see a disposed BitmapData before they call super()
+     let name = this.instance_class().name();
+-    let character = activation
+-        .context
+-        .library
+-        .avm2_class_registry()
+-        .class_symbol(this.instance_class())
++    let character = this.instance_class().library_symbol()
+         .and_then(|(movie, chara_id)| {
+             activation
+                 .context
+                 .library
+-                .library_for_movie_mut(movie)
++                .library_for_movie_mut(movie, activation.gc())
+                 .character_by_id(chara_id)
+         });
+ 
+     let new_bitmap_data = if let Some(Character::Bitmap(bitmap)) = character {
+         // Instantiating BitmapData from an Animate-style bitmap asset
+-        fill_bitmap_data_from_symbol(activation, bitmap.compressed())
++        fill_bitmap_data_from_symbol(activation, &bitmap, name)?
+     } else {
+         if character.is_some() {
+             //TODO: Determine if mismatched symbols will still work as a
+diff --git a/core/src/avm2/globals/flash/display/graphics.rs b/core/src/avm2/globals/flash/display/graphics.rs
+index 7770dba..093b552 100644
+--- a/core/src/avm2/globals/flash/display/graphics.rs
++++ b/core/src/avm2/globals/flash/display/graphics.rs
+@@ -75,7 +75,16 @@ pub fn begin_bitmap_fill<'gc>(
+         let is_repeating = args.get_bool(2);
+         let is_smoothed = args.get_bool(3);
+ 
+-        let handle = bitmap.bitmap_handle(activation.gc(), activation.context.renderer);
++        if bitmap.width() == 0 || bitmap.height() == 0 {
++            if let Some(mut draw) = this.as_drawing() {
++                draw.set_fill_style(Some(FillStyle::Color(Color::TRANSPARENT)));
++            }
++            return Ok(Value::Undefined);
++        }
++
++        let handle = bitmap
++            .try_bitmap_handle(activation.gc(), activation.context.renderer)
++            .map_err(|error| Error::rust_error(Box::new(error)))?;
+ 
+         let bitmap = ruffle_render::bitmap::BitmapInfo {
+             handle,
+@@ -1327,7 +1336,16 @@ pub fn line_bitmap_style<'gc>(
+         let is_repeating = args.get_bool(2);
+         let is_smoothed = args.get_bool(3);
+ 
+-        let handle = bitmap.bitmap_handle(activation.gc(), activation.context.renderer);
++        if bitmap.width() == 0 || bitmap.height() == 0 {
++            if let Some(mut draw) = this.as_drawing() {
++                draw.set_line_fill_style(FillStyle::Color(Color::TRANSPARENT));
++            }
++            return Ok(Value::Undefined);
++        }
++
++        let handle = bitmap
++            .try_bitmap_handle(activation.gc(), activation.context.renderer)
++            .map_err(|error| Error::rust_error(Box::new(error)))?;
+ 
+         let bitmap = ruffle_render::bitmap::BitmapInfo {
+             handle,
+@@ -1801,7 +1819,13 @@ fn handle_bitmap_fill<'gc>(
+         .get_slot(graphics_bitmap_fill_slots::SMOOTH)
+         .coerce_to_boolean();
+ 
+-    let handle = bitmap_data.bitmap_handle(activation.gc(), activation.context.renderer);
++    if bitmap_data.width() == 0 || bitmap_data.height() == 0 {
++        return Ok(FillStyle::Color(Color::TRANSPARENT));
++    }
++
++    let handle = bitmap_data
++            .try_bitmap_handle(activation.gc(), activation.context.renderer)
++            .map_err(|error| Error::rust_error(Box::new(error)))?;
+ 
+     let bitmap = ruffle_render::bitmap::BitmapInfo {
+         handle,
+diff --git a/core/src/avm2/globals/flash/display/loader.rs b/core/src/avm2/globals/flash/display/loader.rs
+index cdfa1eb..652c5cf 100644
+--- a/core/src/avm2/globals/flash/display/loader.rs
++++ b/core/src/avm2/globals/flash/display/loader.rs
+@@ -5,7 +5,7 @@ use indexmap::IndexMap;
+ 
+ use crate::avm2::ClassObject;
+ use crate::avm2::activation::Activation;
+-use crate::avm2::error::make_error_2007;
++use crate::avm2::error::{make_error_2007, make_error_2029};
+ use crate::avm2::globals::flash::display::display_object::initialize_for_allocator;
+ use crate::avm2::globals::slots::flash_display_loader as loader_slots;
+ use crate::avm2::globals::slots::flash_net_url_request as url_request_slots;
+@@ -16,7 +16,6 @@ use crate::avm2::object::TObject as _;
+ use crate::avm2::parameters::ParametersExt;
+ use crate::avm2::value::Value;
+ use crate::avm2::{Error, Object};
+-use crate::avm2_stub_method;
+ use crate::backend::navigator::{NavigationMethod, Request};
+ use crate::display_object::LoaderDisplay;
+ use crate::display_object::MovieClip;
+@@ -79,16 +78,10 @@ pub fn load<'gc>(
+ 
+     let loader_info = loader_info.as_loader_info_object().unwrap();
+ 
+-    if loader_info.init_event_fired() {
+-        // FIXME: When calling load/loadBytes, then calling load/loadBytes again
+-        // before the `init` event is fired, the first load is cancelled.
+-        avm2_stub_method!(
+-            activation,
+-            "flash.display.Loader",
+-            "load",
+-            "reusing a Loader"
+-        );
+-    }
++    activation
++        .context
++        .load_manager
++        .cancel_pending_avm2_download(loader_info);
+ 
+     // Unload the loader, in case something was already loaded.
+     loader_info.unload(activation.context);
+@@ -260,16 +253,10 @@ pub fn load_bytes<'gc>(
+ 
+     let loader_info = loader_info.as_loader_info_object().unwrap();
+ 
+-    if loader_info.init_event_fired() {
+-        // FIXME: When calling load/loadBytes, then calling load/loadBytes again
+-        // before the `init` event is fired, the first load is cancelled.
+-        avm2_stub_method!(
+-            activation,
+-            "flash.display.Loader",
+-            "loadBytes",
+-            "reusing a Loader"
+-        );
+-    }
++    activation
++        .context
++        .load_manager
++        .cancel_pending_avm2_download(loader_info);
+ 
+     // Unload the loader, in case something was already loaded.
+     loader_info.unload(activation.context);
+@@ -332,3 +319,28 @@ pub fn unload<'gc>(
+ 
+     Ok(Value::Undefined)
+ }
++
++pub fn close<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Value<'gc>,
++    _args: FunctionArgs<'_, 'gc>,
++) -> Result<Value<'gc>, Error<'gc>> {
++    let loader_info = this
++        .as_object()
++        .unwrap()
++        .get_slot(loader_slots::_CONTENT_LOADER_INFO)
++        .as_object()
++        .unwrap()
++        .as_loader_info_object()
++        .unwrap();
++
++    if activation
++        .context
++        .load_manager
++        .cancel_pending_avm2_download(loader_info)
++    {
++        Ok(Value::Undefined)
++    } else {
++        Err(make_error_2029(activation))
++    }
++}
+diff --git a/core/src/avm2/globals/flash/display/loader_info.rs b/core/src/avm2/globals/flash/display/loader_info.rs
+index 3d1550b..6bd863b 100644
+--- a/core/src/avm2/globals/flash/display/loader_info.rs
++++ b/core/src/avm2/globals/flash/display/loader_info.rs
+@@ -52,7 +52,7 @@ pub fn get_application_domain<'gc>(
+                 let domain = activation
+                     .context
+                     .library
+-                    .library_for_movie_mut(movie)
++                    .library_for_movie_mut(movie, activation.gc())
+                     .try_avm2_domain();
+ 
+                 if let Some(domain) = domain {
+@@ -67,7 +67,7 @@ pub fn get_application_domain<'gc>(
+                 let domain = activation
+                     .context
+                     .library
+-                    .library_for_movie_mut(movie)
++                    .library_for_movie_mut(movie, activation.gc())
+                     .avm2_domain();
+                 return Ok(DomainObject::from_domain(activation, domain).into());
+             }
+diff --git a/core/src/avm2/globals/flash/display/simple_button.rs b/core/src/avm2/globals/flash/display/simple_button.rs
+index 2861409..d79a287 100644
+--- a/core/src/avm2/globals/flash/display/simple_button.rs
++++ b/core/src/avm2/globals/flash/display/simple_button.rs
+@@ -39,16 +39,12 @@ pub fn simple_button_allocator<'gc>(
+             return Ok(obj.into());
+         }
+ 
+-        if let Some((movie, symbol)) = activation
+-            .context
+-            .library
+-            .avm2_class_registry()
+-            .class_symbol(class)
++        if let Some((movie, symbol)) = class.library_symbol()
+         {
+             let child = activation
+                 .context
+                 .library
+-                .library_for_movie_mut(movie)
++                .library_for_movie_mut(movie, activation.gc())
+                 .instantiate_by_id(symbol, activation.context.gc_context);
+ 
+             if let Some(child) = child {
+diff --git a/core/src/avm2/globals/flash/display/sprite.rs b/core/src/avm2/globals/flash/display/sprite.rs
+index 90a16f2..a8ba61c 100644
+--- a/core/src/avm2/globals/flash/display/sprite.rs
++++ b/core/src/avm2/globals/flash/display/sprite.rs
+@@ -30,16 +30,12 @@ pub fn sprite_allocator<'gc>(
+             );
+         }
+ 
+-        if let Some((movie, symbol)) = activation
+-            .context
+-            .library
+-            .avm2_class_registry()
+-            .class_symbol(class)
++        if let Some((movie, symbol)) = class.library_symbol()
+         {
+             let child = activation
+                 .context
+                 .library
+-                .library_for_movie_mut(movie)
++                .library_for_movie_mut(movie, activation.gc())
+                 .instantiate_by_id(symbol, activation.context.gc_context);
+ 
+             if let Some(child) = child {
+diff --git a/core/src/avm2/globals/flash/media/sound.rs b/core/src/avm2/globals/flash/media/sound.rs
+index 45a3953..d7814bb 100644
+--- a/core/src/avm2/globals/flash/media/sound.rs
++++ b/core/src/avm2/globals/flash/media/sound.rs
+@@ -28,16 +28,12 @@ pub fn init<'gc>(
+     if let Some(sound_object) = this.as_object().and_then(|o| o.as_sound_object()) {
+         let class_def = this.instance_class(activation);
+ 
+-        if let Some((movie, symbol)) = activation
+-            .context
+-            .library
+-            .avm2_class_registry()
+-            .class_symbol(class_def)
++        if let Some((movie, symbol)) = class_def.library_symbol()
+         {
+             if let Some(Character::Sound(sound)) = activation
+                 .context
+                 .library
+-                .library_for_movie_mut(movie)
++                .library_for_movie_mut(movie, activation.gc())
+                 .character_by_id(symbol)
+             {
+                 sound_object.set_sound(activation.context, sound);
+diff --git a/core/src/avm2/globals/flash/media/video.rs b/core/src/avm2/globals/flash/media/video.rs
+index e987adb..cc107ba 100644
+--- a/core/src/avm2/globals/flash/media/video.rs
++++ b/core/src/avm2/globals/flash/media/video.rs
+@@ -21,16 +21,12 @@ pub fn video_allocator<'gc>(
+             return Ok(initialize_for_allocator(activation.context, new_do.into(), class).into());
+         }
+ 
+-        if let Some((movie, symbol)) = activation
+-            .context
+-            .library
+-            .avm2_class_registry()
+-            .class_symbol(target)
++        if let Some((movie, symbol)) = target.library_symbol()
+         {
+             let child = activation
+                 .context
+                 .library
+-                .library_for_movie_mut(movie)
++                .library_for_movie_mut(movie, activation.gc())
+                 .instantiate_by_id(symbol, activation.context.gc_context);
+ 
+             if let Some(child) = child {
+diff --git a/core/src/avm2/globals/flash/text/font.rs b/core/src/avm2/globals/flash/text/font.rs
+index d1c5284..5e4f497 100644
+--- a/core/src/avm2/globals/flash/text/font.rs
++++ b/core/src/avm2/globals/flash/text/font.rs
+@@ -151,11 +151,7 @@ pub fn register_font<'gc>(
+     let object = args.get_object(activation, 0, "font")?;
+ 
+     if let Some(class) = object.as_class_object()
+-        && let Some((movie, id)) = activation
+-            .context
+-            .library
+-            .avm2_class_registry()
+-            .class_symbol(class.inner_class_definition())
++        && let Some((movie, id)) = class.inner_class_definition().library_symbol()
+         && let Some(lib) = activation.context.library.library_for_movie(movie)
+         && let Some(Character::Font(font)) = lib.character_by_id(id)
+     {
+diff --git a/core/src/avm2/object/bytearray_object.rs b/core/src/avm2/object/bytearray_object.rs
+index 8838dc1..58d29f4 100644
+--- a/core/src/avm2/object/bytearray_object.rs
++++ b/core/src/avm2/object/bytearray_object.rs
+@@ -18,11 +18,7 @@ pub fn byte_array_allocator<'gc>(
+     class: ClassObject<'gc>,
+     activation: &mut Activation<'_, 'gc>,
+ ) -> Result<Object<'gc>, Error<'gc>> {
+-    let storage = if let Some((movie, id)) = activation
+-        .context
+-        .library
+-        .avm2_class_registry()
+-        .class_symbol(class.inner_class_definition())
++    let storage = if let Some((movie, id)) = class.inner_class_definition().library_symbol()
+     {
+         if let Some(lib) = activation.context.library.library_for_movie(movie) {
+             if let Some(Character::BinaryData(binary_data)) = lib.character_by_id(id) {
+diff --git a/core/src/avm2/object/font_object.rs b/core/src/avm2/object/font_object.rs
+index 5b282d1..eb7228a 100644
+--- a/core/src/avm2/object/font_object.rs
++++ b/core/src/avm2/object/font_object.rs
+@@ -14,11 +14,7 @@ pub fn font_allocator<'gc>(
+ ) -> Result<Object<'gc>, Error<'gc>> {
+     let base = ScriptObjectData::new(class);
+ 
+-    let font = if let Some((movie, id)) = activation
+-        .context
+-        .library
+-        .avm2_class_registry()
+-        .class_symbol(class.inner_class_definition())
++    let font = if let Some((movie, id)) = class.inner_class_definition().library_symbol()
+     {
+         if let Some(lib) = activation.context.library.library_for_movie(movie) {
+             if let Some(Character::Font(font)) = lib.character_by_id(id) {
+diff --git a/core/src/avm2/object/loaderinfo_object.rs b/core/src/avm2/object/loaderinfo_object.rs
+index b10ed61..20e1c6e 100644
+--- a/core/src/avm2/object/loaderinfo_object.rs
++++ b/core/src/avm2/object/loaderinfo_object.rs
+@@ -178,10 +178,6 @@ impl<'gc> LoaderInfoObject<'gc> {
+         self.0.errored.get()
+     }
+ 
+-    pub fn init_event_fired(self) -> bool {
+-        self.0.init_event_fired.get()
+-    }
+-
+     pub fn reset_init_and_complete_events(self) {
+         self.0.init_event_fired.set(false);
+         self.0.complete_event_fired.set(false);
+diff --git a/core/src/avm2.rs b/core/src/avm2.rs
+index 389112d..a465df7 100644
+--- a/core/src/avm2.rs
++++ b/core/src/avm2.rs
+@@ -470,7 +470,7 @@ impl<'gc> Avm2<'gc> {
+ 
+         let class = class_object.inner_class_definition();
+ 
+-        let library = activation.context.library.library_for_movie_mut(movie);
++        let library = activation.context.library.library_for_movie_mut(movie, activation.gc());
+         let character = library.character_by_id(id);
+ 
+         if let Some(character) = character {
+diff --git a/core/src/backend/audio.rs b/core/src/backend/audio.rs
+index 0f63f6b..bd5d54c 100644
+--- a/core/src/backend/audio.rs
++++ b/core/src/backend/audio.rs
+@@ -802,7 +802,7 @@ impl<'gc> AudioManager<'gc> {
+     ) {
+         if let Some(handle) = context
+             .library
+-            .library_for_movie_mut(display_object.movie())
++            .library_for_movie_mut(display_object.movie(), context.gc())
+             .get_sound(character_id)
+         {
+             use swf::SoundEvent;
+diff --git a/core/src/binary_data.rs b/core/src/binary_data.rs
+index 4ab133a..b20802b 100644
+--- a/core/src/binary_data.rs
++++ b/core/src/binary_data.rs
+@@ -1,5 +1,5 @@
+ use gc_arena::Collect;
+-use ruffle_common::tag_utils::{SwfMovie, SwfSlice};
++use crate::tag_utils::{SwfMovie, SwfSlice};
+ 
+ #[derive(Collect, Debug)]
+ #[collect(require_static)]
+diff --git a/core/src/bitmap/bitmap_data.rs b/core/src/bitmap/bitmap_data.rs
+index 851671a..6942511 100644
+--- a/core/src/bitmap/bitmap_data.rs
++++ b/core/src/bitmap/bitmap_data.rs
+@@ -2,16 +2,21 @@ use crate::avm2::object::BitmapDataObject;
+ use crate::context::RenderContext;
+ use crate::display_object::{BoundsMode, DisplayObject, DisplayObjectWeak, TDisplayObject};
+ use bitflags::bitflags;
+-use gc_arena::lock::GcRefLock;
+-use gc_arena::{Collect, Gc, Mutation};
++use gc_arena::lock::{GcRefLock, RefLock};
++use gc_arena::{Collect, Gc, GcWeak, Mutation};
++use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+ use ruffle_render::backend::RenderBackend;
+ use ruffle_render::bitmap::{
+     Bitmap, BitmapFormat, BitmapHandle, PixelRegion, PixelSnapping, SyncHandle,
+ };
+ use ruffle_wstr::WStr;
+-use std::cell::Ref;
++use std::cell::{Cell, Ref, RefCell};
++use std::collections::HashMap;
++use std::hash::{DefaultHasher, Hasher};
+ use std::fmt::Debug;
+-use std::ops::Range;
++use std::ops::{Deref, DerefMut, Range};
++use std::sync::{Arc, OnceLock, Weak};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+ use swf::{Rectangle, Twips};
+ use tracing::instrument;
+ 
+@@ -45,8 +50,8 @@ impl LehmerRng {
+ /// unmultiplied values. Make sure to convert the color to the correct form beforehand.
+ // TODO: Maybe split the type into `PremultipliedColor(u32)` and
+ //   `UnmultipliedColor(u32)`?
+-#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, bytemuck::NoUninit)]
+-#[repr(C, align(4))]
++#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, bytemuck::Pod, bytemuck::Zeroable)]
++#[repr(C)]
+ pub struct Color {
+     // Note: even though AS2/AS3 represent colors as (little-endian) BGRA `u32`s, this is stored
+     // in RGBA order to be compatible with what the render backend expects.
+@@ -226,6 +231,14 @@ bitflags! {
+ pub struct BitmapData<'gc>(BitmapRawDataWrapper<'gc>);
+ 
+ impl<'gc> BitmapData<'gc> {
++    fn allocate(mc: &Mutation<'gc>, data: BitmapRawData<'gc>) -> Self {
++        // gc-arena sees the wrapper, but not the separately allocated pixel buffer.
++        // Budget one unit of collection debt per 512 bytes of new pixel storage.
++        mc.metrics()
++            .adjust_debt(data.pixels.capacity() as f64 * size_of::<Color>() as f64 / 512.0);
++        Self(BitmapRawDataWrapper::new(Gc::new(mc, data.into())))
++    }
++
+     pub fn new(
+         mc: &Mutation<'gc>,
+         width: u32,
+@@ -233,10 +246,10 @@ impl<'gc> BitmapData<'gc> {
+         transparency: bool,
+         fill_color: u32,
+     ) -> Self {
+-        let data = BitmapRawData::new(width, height, transparency, fill_color);
+-        let data = BitmapRawDataWrapper::new(Gc::new(mc, data.into()));
+-
+-        Self(data)
++        Self::allocate(
++            mc,
++            BitmapRawData::new(width, height, transparency, fill_color),
++        )
+     }
+ 
+     pub fn new_with_pixels(
+@@ -246,10 +259,26 @@ impl<'gc> BitmapData<'gc> {
+         transparency: bool,
+         pixels: Vec<Color>,
+     ) -> Self {
+-        let data = BitmapRawData::new_with_pixels(width, height, transparency, pixels);
+-        let data = BitmapRawDataWrapper::new(Gc::new(mc, data.into()));
++        Self::allocate(
++            mc,
++            BitmapRawData::new_with_pixels(width, height, transparency, pixels),
++        )
++    }
++
++    pub(crate) fn new_with_shared_pixels(
++        mc: &Mutation<'gc>,
++        width: u32,
++        height: u32,
++        pixels: BitmapPixels,
++    ) -> Self {
++        Self::allocate(
++            mc,
++            BitmapRawData::new_with_shared_pixels(width, height, true, pixels),
++        )
++    }
+ 
+-        Self(data)
++    pub(crate) fn cold_pixel_candidate(self) -> Option<ColdBitmapWeak<'gc>> {
++        self.0.cold_pixel_candidate()
+     }
+ 
+     pub fn dummy(mc: &Mutation<'gc>) -> Self {
+@@ -261,9 +290,10 @@ impl<'gc> BitmapData<'gc> {
+         mc: &Mutation<'gc>,
+         renderer: &mut dyn RenderBackend,
+     ) -> BitmapData<'gc> {
+-        let data = self.0.clone_data(renderer);
+-        let data = BitmapRawDataWrapper::new(Gc::new(mc, data.into()));
+-        Self(data)
++        Self(BitmapRawDataWrapper::new(Gc::new(
++            mc,
++            self.0.clone_data(renderer).into(),
++        )))
+     }
+ 
+     pub fn sync(&self, renderer: &mut dyn RenderBackend) -> GcRefLock<'gc, BitmapRawData<'gc>> {
+@@ -278,6 +308,14 @@ impl<'gc> BitmapData<'gc> {
+         self.0.bitmap_handle(gc_context, renderer)
+     }
+ 
++    pub fn try_bitmap_handle(
++        &self,
++        gc_context: &Mutation<'gc>,
++        renderer: &mut dyn RenderBackend,
++    ) -> Result<BitmapHandle, ruffle_render::error::Error> {
++        self.0.try_bitmap_handle(gc_context, renderer)
++    }
++
+     pub fn overwrite_cpu_pixels_from_gpu(
+         &self,
+         mc: &Mutation<'gc>,
+@@ -363,12 +401,341 @@ impl<'gc> BitmapData<'gc> {
+     }
+ }
+ 
++#[derive(Clone, Copy, Default)]
++enum PixelOrigin {
++    #[default]
++    Generated,
++    Embedded,
++    Supplied,
++    CopyOnWrite,
++}
++
++static BITMAP_BYTES_BY_ORIGIN: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
++
++pub fn bitmap_pixel_bytes_by_origin() -> [usize; 4] {
++    BITMAP_BYTES_BY_ORIGIN.each_ref().map(|bytes| bytes.load(Relaxed))
++}
++static BITMAP_DISPOSE_CALLS: AtomicUsize = AtomicUsize::new(0);
++static BITMAP_DISPOSE_MIB: AtomicUsize = AtomicUsize::new(0);
++static BITMAP_DISPOSE_REMAINDER: AtomicUsize = AtomicUsize::new(0);
++
++pub fn bitmap_disposal_diagnostics() -> (usize, usize) {
++    (BITMAP_DISPOSE_CALLS.load(Relaxed), BITMAP_DISPOSE_MIB.load(Relaxed))
++}
++
++pub fn bitmap_pixel_bytes() -> usize {
++    bitmap_pixel_bytes_by_origin().into_iter().sum()
++}
++
++#[derive(Clone, Default)]
++pub(crate) struct BitmapPixels(Arc<PixelBuffer>);
++
++#[derive(Default, Debug)]
++pub(crate) struct WeakBitmapPixels(Weak<PixelBuffer>);
++
++impl WeakBitmapPixels {
++    pub(crate) fn upgrade(&self) -> Option<BitmapPixels> {
++        self.0.upgrade().map(BitmapPixels)
++    }
++}
++
++const MIN_COLD_PIXEL_BYTES: usize = 512 * 1024;
++const MAX_COLD_PIXEL_BYTES: usize = 8 * 1024 * 1024;
++const COLD_SECONDS: usize = 20;
++const MIN_EMBEDDED_PRESSURE_BYTES: usize = 128 * 1024 * 1024;
++static PACKED_PIXEL_BYTES: AtomicUsize = AtomicUsize::new(0);
++static PACKED_PIXEL_BUFFERS: AtomicUsize = AtomicUsize::new(0);
++static PACKED_PIXEL_RESTORES: AtomicUsize = AtomicUsize::new(0);
++
++thread_local! {
++    static PIXEL_CLOCK: Cell<usize> = const { Cell::new(0) };
++}
++
++pub(crate) fn set_cold_bitmap_clock(seconds: usize) -> bool {
++    PIXEL_CLOCK.set(seconds);
++    BITMAP_BYTES_BY_ORIGIN[PixelOrigin::Embedded as usize].load(Relaxed)
++        >= MIN_EMBEDDED_PRESSURE_BYTES
++}
++
++struct PackedPixels {
++    bytes: Vec<u8>,
++    len: usize,
++}
++
++impl PackedPixels {
++    fn encode(raw: &[Color]) -> Option<Self> {
++        let input = Color::slice_as_rgba(raw);
++        let mut bytes = Vec::new();
++        // Give up if we cannot save at least half of the decoded allocation.
++        bytes.try_reserve_exact(input.len() / 2).ok()?;
++        let mut encoder = Compress::new(Compression::fast(), false);
++        let status = encoder.compress_vec(input, &mut bytes, FlushCompress::Finish).ok()?;
++        if status != Status::StreamEnd || encoder.total_in() != input.len() as u64 {
++            return None;
++        }
++        bytes.shrink_to_fit();
++        PACKED_PIXEL_BYTES.fetch_add(bytes.capacity(), Relaxed);
++        PACKED_PIXEL_BUFFERS.fetch_add(1, Relaxed);
++        Some(Self { bytes, len: raw.len() })
++    }
++
++    fn decode(&self) -> Vec<Color> {
++        let mut colors = vec![Color::default(); self.len];
++        let output = bytemuck::cast_slice_mut(&mut colors);
++        let mut decoder = Decompress::new(false);
++        let status = decoder
++            .decompress(&self.bytes, output, FlushDecompress::Finish)
++            .expect("Internally compressed BitmapData must decode");
++        assert_eq!(status, Status::StreamEnd);
++        assert_eq!(decoder.total_out(), output.len() as u64);
++        assert_eq!(decoder.total_in(), self.bytes.len() as u64);
++        PACKED_PIXEL_RESTORES.fetch_add(1, Relaxed);
++        colors
++    }
++}
++
++impl Drop for PackedPixels {
++    fn drop(&mut self) {
++        PACKED_PIXEL_BYTES.fetch_sub(self.bytes.capacity(), Relaxed);
++        PACKED_PIXEL_BUFFERS.fetch_sub(1, Relaxed);
++    }
++}
++
++#[derive(Default)]
++struct PixelBuffer {
++    raw: OnceLock<Vec<Color>>,
++    packed: Option<Arc<PackedPixels>>,
++    origin: PixelOrigin,
++    last_access: AtomicUsize,
++    packing_rejected: AtomicBool,
++}
++
++impl PixelBuffer {
++    fn new(pixels: Vec<Color>, origin: PixelOrigin) -> Self {
++        BITMAP_BYTES_BY_ORIGIN[origin as usize]
++            .fetch_add(pixels.capacity() * size_of::<Color>(), Relaxed);
++        Self {
++            raw: OnceLock::from(pixels),
++            origin,
++            last_access: AtomicUsize::new(PIXEL_CLOCK.get()),
++            packed: None,
++            packing_rejected: AtomicBool::new(false),
++        }
++    }
++
++    fn touch(&self) {
++        if matches!(self.origin, PixelOrigin::Embedded) {
++            self.last_access.store(PIXEL_CLOCK.get(), Relaxed);
++        }
++    }
++
++    fn colors(&self) -> &[Color] {
++        self.touch();
++        self.raw.get_or_init(|| {
++            let Some(packed) = &self.packed else {
++                return Vec::new();
++            };
++            let pixels = packed.decode();
++            BITMAP_BYTES_BY_ORIGIN[self.origin as usize]
++                .fetch_add(pixels.capacity() * size_of::<Color>(), Relaxed);
++            pixels
++        })
++    }
++
++    fn capacity(&self) -> usize {
++        self.raw.get().map_or(0, Vec::capacity)
++    }
++}
++
++impl Clone for PixelBuffer {
++    fn clone(&self) -> Self {
++        Self::new(self.colors().to_vec(), PixelOrigin::CopyOnWrite)
++    }
++}
++
++impl Drop for PixelBuffer {
++    fn drop(&mut self) {
++        BITMAP_BYTES_BY_ORIGIN[self.origin as usize]
++            .fetch_sub(self.capacity() * size_of::<Color>(), Relaxed);
++    }
++}
++
++thread_local! {
++    static EMBEDDED_PIXEL_CLASSES: RefCell<HashMap<usize, (String, WeakBitmapPixels)>> =
++        RefCell::new(HashMap::new());
++    static EMBEDDED_PIXEL_BUFFERS: RefCell<HashMap<u64, WeakBitmapPixels>> =
++        RefCell::new(HashMap::new());
++}
++
++impl BitmapPixels {
++    fn new(pixels: Vec<Color>, origin: PixelOrigin) -> Self {
++        Self(Arc::new(PixelBuffer::new(pixels, origin)))
++    }
++
++    pub(crate) fn from_embedded(pixels: Vec<Color>) -> Self {
++        const MIN_SHARED_PIXELS: usize = 16_384;
++        const MAX_SHARED_ENTRIES: usize = 4096;
++        if pixels.len() < MIN_SHARED_PIXELS {
++            return Self::new(pixels, PixelOrigin::Embedded);
++        }
++        let mut hash = DefaultHasher::new();
++        hash.write(Color::slice_as_rgba(&pixels));
++        let key = hash.finish();
++        EMBEDDED_PIXEL_BUFFERS.with_borrow_mut(|buffers| {
++            if let Some(existing) = buffers.get(&key).and_then(WeakBitmapPixels::upgrade)
++                && existing.0.raw.get().is_some_and(|raw| *raw == pixels)
++            {
++                return existing;
++            }
++            if buffers.len() == MAX_SHARED_ENTRIES {
++                buffers.retain(|_, value| value.0.strong_count() != 0);
++            }
++            let pixels = Self::new(pixels, PixelOrigin::Embedded);
++            if buffers.len() < MAX_SHARED_ENTRIES {
++                buffers.insert(key, pixels.downgrade());
++            }
++            pixels
++        })
++    }
++
++    pub(crate) fn record_embedded_class(&self, class: crate::avm2::QName<'_>) {
++        // The index keeps no GC objects or pixel data alive.
++        if self.capacity() < 16_384 {
++            return;
++        }
++        EMBEDDED_PIXEL_CLASSES.with_borrow_mut(|entries| {
++            let key = Arc::as_ptr(&self.0) as usize;
++            if entries.len() >= 4096 {
++                entries.retain(|_, (_, pixels)| pixels.0.strong_count() != 0);
++            }
++            if entries.len() < 4096 {
++                entries.entry(key).or_insert_with(|| {
++                    let name = class.local_name();
++                    (name.to_utf8_lossy().chars().take(120).collect(), self.downgrade())
++                });
++            }
++        });
++    }
++
++    pub(crate) fn downgrade(&self) -> WeakBitmapPixels {
++        WeakBitmapPixels(Arc::downgrade(&self.0))
++    }
++
++    fn capacity(&self) -> usize {
++        self.0.capacity()
++    }
++
++    fn pack_if_idle(&mut self) -> bool {
++        let buffer = &self.0;
++        if buffer.packing_rejected.load(Relaxed)
++            || Arc::strong_count(buffer) != 1
++            || PIXEL_CLOCK.get().saturating_sub(buffer.last_access.load(Relaxed)) < COLD_SECONDS
++            || !(MIN_COLD_PIXEL_BYTES..=MAX_COLD_PIXEL_BYTES)
++                .contains(&(buffer.capacity() * size_of::<Color>()))
++        {
++            return false;
++        }
++        let packed = buffer.packed.clone().or_else(|| {
++            PackedPixels::encode(buffer.raw.get().expect("Resident BitmapData")).map(Arc::new)
++        });
++        let Some(packed) = packed else {
++            // Do not repeatedly try to compress an unchanged buffer.
++            buffer.packing_rejected.store(true, Relaxed);
++            return true;
++        };
++        let old_key = Arc::as_ptr(buffer) as usize;
++        self.0 = Arc::new(PixelBuffer {
++            packed: Some(packed),
++            origin: PixelOrigin::Embedded,
++            last_access: AtomicUsize::new(PIXEL_CLOCK.get()),
++            raw: OnceLock::new(),
++            packing_rejected: AtomicBool::new(false),
++        });
++        EMBEDDED_PIXEL_CLASSES.with_borrow_mut(|entries| {
++            if let Some((name, _)) = entries.remove(&old_key) {
++                entries.insert(Arc::as_ptr(&self.0) as usize, (name, self.downgrade()));
++            }
++        });
++        true
++    }
++}
++
++#[derive(Copy, Clone, Collect)]
++#[collect(no_drop)]
++pub(crate) struct ColdBitmapWeak<'gc>(GcWeak<'gc, RefLock<BitmapRawData<'gc>>>);
++
++impl<'gc> ColdBitmapWeak<'gc> {
++    pub(crate) fn is_dropped(self) -> bool {
++        self.0.is_dropped()
++    }
++
++    pub(crate) fn pack_if_idle(self, mc: &Mutation<'gc>) -> bool {
++        let Some(bitmap) = self.0.upgrade(mc) else {
++            return false;
++        };
++        let mut bitmap = bitmap.borrow_mut(mc);
++        if !matches!(bitmap.dirty_state, DirtyState::Clean)
++            || !matches!(bitmap.pixels.0.origin, PixelOrigin::Embedded)
++        {
++            return false;
++        }
++        bitmap.pixels.pack_if_idle()
++    }
++}
++
++pub fn embedded_bitmap_class_summary() -> String {
++    EMBEDDED_PIXEL_CLASSES.with_borrow_mut(|entries| {
++        let mut totals = HashMap::new();
++        entries.retain(|_, (name, pixels)| {
++            if let Some(pixels) = pixels.upgrade() {
++                let bytes = pixels.capacity() * size_of::<Color>();
++                if bytes != 0 {
++                    *totals.entry(name.as_str().to_owned()).or_insert(0usize) += bytes;
++                }
++                true
++            } else {
++                false
++            }
++        });
++        let mut rows: Vec<_> = totals.into_iter().collect();
++        rows.sort_unstable_by(|(a_name, a_size), (b_name, b_size)| {
++            b_size.cmp(a_size).then_with(|| a_name.cmp(b_name))
++        });
++        let tracked: usize = rows.iter().map(|(_, bytes)| bytes).sum();
++        rows.truncate(24);
++        serde_json::json!({
++            "tracked_bytes": tracked,
++            "classes": rows,
++            "packed_bytes": PACKED_PIXEL_BYTES.load(Relaxed),
++            "packed_buffers": PACKED_PIXEL_BUFFERS.load(Relaxed),
++            "packed_restores": PACKED_PIXEL_RESTORES.load(Relaxed),
++        }).to_string()
++    })
++}
++
++impl Deref for BitmapPixels {
++    type Target = [Color];
++
++    fn deref(&self) -> &[Color] {
++        self.0.colors()
++    }
++}
++
++impl DerefMut for BitmapPixels {
++    fn deref_mut(&mut self) -> &mut [Color] {
++        let buffer = Arc::make_mut(&mut self.0);
++        buffer.colors();
++        buffer.packed = None;
++        buffer.raw.get_mut().expect("Resident BitmapData")
++    }
++}
++
+ #[derive(Collect)]
+ #[collect(no_drop)]
+ pub struct BitmapRawData<'gc> {
+     /// The pixels in the bitmap, stored as a array of pre-multiplied ARGB colour values
+     #[collect(require_static)]
+-    pixels: Vec<Color>,
++    pixels: BitmapPixels,
+ 
+     width: u32,
+     height: u32,
+@@ -429,7 +796,7 @@ mod wrapper {
+     use ruffle_render::commands::CommandHandler;
+     use std::cell::Ref;
+ 
+-    use super::{BitmapRawData, DirtyState, copy_pixels_to_bitmapdata};
++    use super::{BitmapRawData, ColdBitmapWeak, DirtyState, MAX_COLD_PIXEL_BYTES, MIN_COLD_PIXEL_BYTES, copy_pixels_to_bitmapdata};
+ 
+     /// A wrapper type that ensures that we always wait for a pending
+     /// GPU -> CPU sync to complete (using `sync_handle`) before accessing
+@@ -468,6 +835,13 @@ mod wrapper {
+             BitmapRawDataWrapper(data)
+         }
+ 
++        pub(crate) fn cold_pixel_candidate(self) -> Option<ColdBitmapWeak<'gc>> {
++            let bitmap = self.0.borrow();
++            let bytes = bitmap.width as usize * bitmap.height as usize * size_of::<super::Color>();
++            (MIN_COLD_PIXEL_BYTES..=MAX_COLD_PIXEL_BYTES).contains(&bytes)
++                .then(|| ColdBitmapWeak(Gc::downgrade(self.0)))
++        }
++
+         // Creates a dummy BitmapData with no pixels or handle, marked as disposed.
+         // This is used for AS3 `Bitmap` instances without a corresponding AS3 `BitmapData` instance.
+         // Marking it as disposed skips rendering, and the unset `avm2_object` will cause this to
+@@ -476,7 +850,7 @@ mod wrapper {
+             BitmapRawDataWrapper(Gc::new(
+                 mc,
+                 BitmapRawData {
+-                    pixels: Vec::new(),
++                    pixels: super::BitmapPixels::default(),
+                     width: 0,
+                     height: 0,
+                     transparency: false,
+@@ -554,9 +928,16 @@ mod wrapper {
+             gc_context: &Mutation<'gc>,
+             renderer: &mut dyn RenderBackend,
+         ) -> BitmapHandle {
+-            let mut bitmap_data = self.0.borrow_mut(gc_context);
+-            bitmap_data.update_dirty_texture(renderer);
+-            bitmap_data.bitmap_handle(renderer)
++            self.try_bitmap_handle(gc_context, renderer)
++                .expect("Failed to register bitmap")
++        }
++
++        pub fn try_bitmap_handle(
++            &self,
++            gc_context: &Mutation<'gc>,
++            renderer: &mut dyn RenderBackend,
++        ) -> Result<BitmapHandle, ruffle_render::error::Error> {
++            self.0.borrow_mut(gc_context).try_update_dirty_texture(renderer)
+         }
+ 
+         /// Provides access to the underlying `BitmapData`.
+@@ -669,8 +1050,13 @@ mod wrapper {
+ 
+             // Note - we do a CPU -> GPU sync, but we do *not* do a GPU -> CPU sync
+             // (rendering is done on the GPU, so the CPU pixels don't need to be up-to-date).
+-            inner_bitmap_data.update_dirty_texture(context.renderer);
+-            let handle = inner_bitmap_data.bitmap_handle(context.renderer);
++            let handle = match inner_bitmap_data.try_update_dirty_texture(context.renderer) {
++                Ok(handle) => handle,
++                Err(error) => {
++                    tracing::error!("Failed to render bitmap: {error}");
++                    return;
++                }
++            };
+ 
+             context.commands.render_bitmap(
+                 handle,
+@@ -732,10 +1118,13 @@ impl std::fmt::Debug for BitmapRawData<'_> {
+ impl<'gc> BitmapRawData<'gc> {
+     pub fn new(width: u32, height: u32, transparency: bool, fill_color: u32) -> Self {
+         Self {
+-            pixels: vec![
+-                Color::bgra_u32(fill_color).to_premultiplied_alpha(transparency);
+-                width as usize * height as usize
+-            ],
++            pixels: BitmapPixels::new(
++                vec![
++                    Color::bgra_u32(fill_color).to_premultiplied_alpha(transparency);
++                    width as usize * height as usize
++                ],
++                PixelOrigin::Generated,
++            ),
+             width,
+             height,
+             transparency,
+@@ -754,6 +1143,20 @@ impl<'gc> BitmapRawData<'gc> {
+         height: u32,
+         transparency: bool,
+         pixels: Vec<Color>,
++    ) -> Self {
++        Self::new_with_shared_pixels(
++            width,
++            height,
++            transparency,
++            BitmapPixels::new(pixels, PixelOrigin::Supplied),
++        )
++    }
++
++    fn new_with_shared_pixels(
++        width: u32,
++        height: u32,
++        transparency: bool,
++        pixels: BitmapPixels,
+     ) -> Self {
+         Self {
+             pixels,
+@@ -777,7 +1180,14 @@ impl<'gc> BitmapRawData<'gc> {
+     pub fn dispose(&mut self) {
+         self.width = 0;
+         self.height = 0;
+-        self.pixels = Vec::new(); // free the CPU pixel buffer
++        BITMAP_DISPOSE_CALLS.fetch_add(1, Relaxed);
++        if Arc::strong_count(&self.pixels.0) == 1 {
++            const MIB: usize = 1024 * 1024;
++            let bytes = self.pixels.capacity() * size_of::<Color>();
++            let prior = BITMAP_DISPOSE_REMAINDER.fetch_add(bytes % MIB, Relaxed);
++            BITMAP_DISPOSE_MIB.fetch_add(bytes / MIB + (prior % MIB + bytes % MIB) / MIB, Relaxed);
++        }
++        self.pixels = BitmapPixels::default(); // free the CPU pixel buffer
+         self.bitmap_handle = None;
+         // There's no longer a handle to update
+         self.dirty_state = DirtyState::Clean;
+@@ -788,6 +1198,7 @@ impl<'gc> BitmapRawData<'gc> {
+         &mut self,
+         renderer: &mut dyn RenderBackend,
+     ) -> Result<BitmapHandle, ruffle_render::error::Error> {
++        self.pixels.0.touch();
+         if let Some(ref handle) = self.bitmap_handle {
+             return Ok(handle.clone());
+         }
+@@ -900,7 +1311,7 @@ impl<'gc> BitmapRawData<'gc> {
+         self.pixels[(x + y * self.width()) as usize]
+     }
+ 
+-    pub fn raw_pixels_mut(&mut self) -> &mut Vec<Color> {
++    pub fn raw_pixels_mut(&mut self) -> &mut [Color] {
+         &mut self.pixels
+     }
+ 
+@@ -911,25 +1322,30 @@ impl<'gc> BitmapRawData<'gc> {
+     // Updates the data stored with our `BitmapHandle` if this `BitmapRawData`
+     // is dirty
+     pub fn update_dirty_texture(&mut self, renderer: &mut dyn RenderBackend) {
+-        let handle = self.bitmap_handle(renderer);
+-        match &self.dirty_state {
+-            DirtyState::CpuModified(region) => {
+-                if let Err(e) = renderer.update_texture(
+-                    &handle,
+-                    Bitmap::new(
+-                        self.width(),
+-                        self.height(),
+-                        BitmapFormat::Rgba,
+-                        self.pixels_rgba(),
+-                    ),
+-                    *region,
+-                ) {
+-                    tracing::error!("Failed to update dirty bitmap {:?}: {:?}", handle, e);
+-                }
+-                self.dirty_state = DirtyState::Clean
+-            }
+-            DirtyState::Clean | DirtyState::GpuModified(_, _) => {}
++        if let Err(error) = self.try_update_dirty_texture(renderer) {
++            tracing::error!("Failed to sync bitmap texture: {error}");
++        }
++    }
++
++    fn try_update_dirty_texture(
++        &mut self,
++        renderer: &mut dyn RenderBackend,
++    ) -> Result<BitmapHandle, ruffle_render::error::Error> {
++        let handle = self.try_bitmap_handle(renderer)?;
++        if let DirtyState::CpuModified(region) = self.dirty_state {
++            renderer.update_texture(
++                &handle,
++                Bitmap::new(
++                    self.width(),
++                    self.height(),
++                    BitmapFormat::Rgba,
++                    self.pixels_rgba(),
++                ),
++                region,
++            )?;
++            self.dirty_state = DirtyState::Clean;
+         }
++        Ok(handle)
+     }
+ 
+     fn inform_display_objects(&self, gc_context: &Mutation<'gc>) {
+diff --git a/core/src/bitmap/operations.rs b/core/src/bitmap/operations.rs
+index 1e0246b..7878332 100644
+--- a/core/src/bitmap/operations.rs
++++ b/core/src/bitmap/operations.rs
+@@ -1383,7 +1383,14 @@ pub fn draw<'gc>(
+     quality: StageQuality,
+ ) -> Result<(), BitmapDataDrawError> {
+     // Calculate the maximum potential area that this draw call will affect
+-    let bounds = transform.matrix * source.bounds();
++    let bounds = match &source {
++        IBitmapDrawable::DisplayObject(object)
++            if object.as_edit_text().is_some() && !object.filters().is_empty() =>
++        {
++            object.render_bounds_with_transform(&transform.matrix, true, &Matrix::IDENTITY)
++        }
++        _ => transform.matrix * source.bounds(),
++    };
+     let mut dirty_region = PixelRegion::from(bounds);
+     dirty_region.clamp(target.width(), target.height());
+     if dirty_region.width() == 0 || dirty_region.height() == 0 {
+@@ -1553,10 +1560,9 @@ pub fn draw<'gc>(
+         dirty_region.union(old);
+     }
+ 
+-    assert!(
+-        cache_draws.is_empty(),
+-        "BitmapData.draw() should not use cacheAsBitmap"
+-    );
++    if !cache_draws.is_empty() {
++        context.renderer.render_bitmap_cache_entries(cache_draws, quality);
++    }
+     let image = context
+         .renderer
+         .render_offscreen(handle, commands, quality, dirty_region);
+diff --git a/core/src/character.rs b/core/src/character.rs
+index f184330..48d859a 100644
+--- a/core/src/character.rs
++++ b/core/src/character.rs
+@@ -1,7 +1,8 @@
+-use std::cell::OnceCell;
++use std::cell::{OnceCell, RefCell};
+ 
+ use crate::backend::audio::SoundHandle;
+ use crate::binary_data::BinaryData;
++use crate::bitmap::bitmap_data::{BitmapPixels, WeakBitmapPixels};
+ use crate::display_object::{
+     Avm1Button, Avm2Button, BitmapClass, EditText, Graphic, MorphShape, MovieClip, Text, Video,
+ };
+@@ -36,6 +37,9 @@ pub enum Character<'gc> {
+ pub struct BitmapCharacter<'gc> {
+     #[collect(require_static)]
+     compressed: CompressedBitmap,
++    // Keep no pixels alive solely because the SWF library still owns the symbol.
++    #[collect(require_static)]
++    avm2_pixels: RefCell<Option<(BitmapSize, WeakBitmapPixels)>>,
+     /// A lazily constructed GPU handle, used when performing fills with this bitmap
+     #[collect(require_static)]
+     handle: OnceCell<BitmapHandle>,
+@@ -48,6 +52,7 @@ impl<'gc> BitmapCharacter<'gc> {
+     pub fn new(compressed: CompressedBitmap) -> Self {
+         Self {
+             compressed,
++            avm2_pixels: RefCell::default(),
+             handle: OnceCell::default(),
+             avm2_class: Lock::new(BitmapClass::NoSubclass),
+         }
+@@ -57,6 +62,16 @@ impl<'gc> BitmapCharacter<'gc> {
+         &self.compressed
+     }
+ 
++    pub(crate) fn avm2_pixels(&self) -> Option<(BitmapSize, BitmapPixels)> {
++        let slot = self.avm2_pixels.borrow();
++        let (size, pixels) = slot.as_ref()?;
++        Some((*size, pixels.upgrade()?))
++    }
++
++    pub(crate) fn remember_avm2_pixels(&self, size: BitmapSize, pixels: &BitmapPixels) {
++        self.avm2_pixels.replace(Some((size, pixels.downgrade())));
++    }
++
+     pub fn avm2_class(&self) -> BitmapClass<'gc> {
+         self.avm2_class.get()
+     }
+diff --git a/core/src/context.rs b/core/src/context.rs
+index a8cb68a..1ac94a7 100644
+--- a/core/src/context.rs
++++ b/core/src/context.rs
+@@ -389,7 +389,7 @@ impl<'gc> UpdateContext<'gc> {
+         activation
+             .context
+             .library
+-            .library_for_movie_mut(*activation.context.root_swf)
++            .library_for_movie_mut(*activation.context.root_swf, activation.gc())
+             .set_avm2_domain(stage_domain);
+         activation.context.ui.set_mouse_visible(true);
+ 
+diff --git a/core/src/debug_ui/movie.rs b/core/src/debug_ui/movie.rs
+index 461e651..3469442 100644
+--- a/core/src/debug_ui/movie.rs
++++ b/core/src/debug_ui/movie.rs
+@@ -88,7 +88,7 @@ impl MovieListWindow {
+                         });
+                     })
+                     .body(|mut body| {
+-                        let movies = context.library.known_movies();
++                        let movies = context.library.known_movies(context.gc());
+ 
+                         for movie in movies {
+                             let url_lower = movie.url().to_ascii_lowercase();
+diff --git a/core/src/display_object/avm1_button.rs b/core/src/display_object/avm1_button.rs
+index 7cbe94a..afa2830 100644
+--- a/core/src/display_object/avm1_button.rs
++++ b/core/src/display_object/avm1_button.rs
+@@ -168,7 +168,7 @@ impl<'gc> Avm1Button<'gc> {
+                     _ => {
+                         if let Some(child) = context
+                             .library
+-                            .library_for_movie_mut(movie)
++                            .library_for_movie_mut(movie, context.gc())
+                             .instantiate_by_id(record.id, context.gc_context)
+                         {
+                             // New child that did not previously exist, create it.
+@@ -301,7 +301,7 @@ impl<'gc> TDisplayObject<'gc> for Avm1Button<'gc> {
+                 if record.states.contains(swf::ButtonState::HIT_TEST) {
+                     match context
+                         .library
+-                        .library_for_movie_mut(self.0.movie())
++                        .library_for_movie_mut(self.0.movie(), context.gc())
+                         .instantiate_by_id(record.id, context.gc_context)
+                     {
+                         Some(child) => {
+diff --git a/core/src/display_object/avm2_button.rs b/core/src/display_object/avm2_button.rs
+index aeb8379..58b04ad 100644
+--- a/core/src/display_object/avm2_button.rs
++++ b/core/src/display_object/avm2_button.rs
+@@ -208,7 +208,7 @@ impl<'gc> Avm2Button<'gc> {
+             if record.states.contains(swf_state) {
+                 match context
+                     .library
+-                    .library_for_movie_mut(movie)
++                    .library_for_movie_mut(movie, context.gc())
+                     .instantiate_by_id(record.id, context.gc_context)
+                 {
+                     Some(child) => {
+diff --git a/core/src/display_object/graphic.rs b/core/src/display_object/graphic.rs
+index b12f771..1968f55 100644
+--- a/core/src/display_object/graphic.rs
++++ b/core/src/display_object/graphic.rs
+@@ -120,6 +120,7 @@ impl<'gc> Graphic<'gc> {
+     }
+ 
+     pub fn drawing_mut(&self) -> RefMut<'_, Drawing> {
++        self.invalidate_cached_bitmap();
+         self.0.drawing.get_or_init(Default::default).borrow_mut()
+     }
+ 
+@@ -151,7 +152,7 @@ impl<'gc> Graphic<'gc> {
+                 .expect("Graphic's movie has a library");
+             context.renderer.register_shape_with_scale(
+                 scale9.apply((&shared.shape).into(), to_grid),
+-                &MovieLibrarySource { library },
++                &MovieLibrarySource { library: &library },
+                 world_scale,
+             )
+         })
+@@ -185,7 +186,7 @@ impl<'gc> Graphic<'gc> {
+             .expect("Graphic's movie has a library");
+         let new_handle = context.renderer.register_shape_with_scale(
+             (&shared.shape).into(),
+-            &MovieLibrarySource { library },
++            &MovieLibrarySource { library: &library },
+             current_scale,
+         );
+ 
+@@ -260,7 +261,7 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
+         // This does not create a new instance, but instead swaps out the underlying static data to point to the new art.
+         if let Some(new_graphic) = context
+             .library
+-            .library_for_movie_mut(self.movie())
++            .library_for_movie_mut(self.movie(), context.gc())
+             .get_graphic(id)
+         {
+             self.set_shared(context.gc(), new_graphic.0.shared.get());
+diff --git a/core/src/display_object/morph_shape.rs b/core/src/display_object/morph_shape.rs
+index 8972325..241e9e2 100644
+--- a/core/src/display_object/morph_shape.rs
++++ b/core/src/display_object/morph_shape.rs
+@@ -72,7 +72,7 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
+     fn replace_with(self, context: &mut UpdateContext<'gc>, id: CharacterId) {
+         if let Some(new_morph_shape) = context
+             .library
+-            .library_for_movie_mut(self.movie())
++            .library_for_movie_mut(self.movie(), context.gc())
+             .get_morph_shape(id)
+         {
+             unlock!(Gc::write(context.gc(), self.0), MorphShapeData, shared)
+@@ -239,7 +239,7 @@ impl<'gc> MorphShapeShared<'gc> {
+             let library = context.library.library_for_movie(self.movie).unwrap();
+             let handle = context
+                 .renderer
+-                .register_shape((&frame.shape).into(), &MovieLibrarySource { library });
++                .register_shape((&frame.shape).into(), &MovieLibrarySource { library: &library });
+             frame.shape_handle = Some(handle.clone());
+             handle
+         }
+diff --git a/core/src/display_object/movie_clip.rs b/core/src/display_object/movie_clip.rs
+index 5939b34..e006afa 100644
+--- a/core/src/display_object/movie_clip.rs
++++ b/core/src/display_object/movie_clip.rs
+@@ -503,7 +503,7 @@ impl<'gc> MovieClip<'gc> {
+         if let Some(symbol) = progress.cur_preload_symbol.take() {
+             match context
+                 .library
+-                .library_for_movie_mut(self.movie())
++                .library_for_movie_mut(self.movie(), context.gc())
+                 .character_by_id(symbol)
+             {
+                 Some(Character::MovieClip(mc)) => {
+@@ -681,7 +681,7 @@ impl<'gc> MovieClip<'gc> {
+         let data = reader.read_slice_to_end();
+         if !data.is_empty() {
+             let movie = self.movie();
+-            let domain = context.library.library_for_movie_mut(movie).avm2_domain();
++            let domain = context.library.library_for_movie_mut(movie, context.gc()).avm2_domain();
+ 
+             // DoAbc tag seems to be equivalent to a DoAbc2 with no flags (eager)
+             match Avm2::do_abc(
+@@ -723,7 +723,7 @@ impl<'gc> MovieClip<'gc> {
+         let do_abc = reader.read_do_abc_2()?;
+         if !do_abc.data.is_empty() {
+             let movie = self.movie();
+-            let domain = context.library.library_for_movie_mut(movie).avm2_domain();
++            let domain = context.library.library_for_movie_mut(movie, context.gc()).avm2_domain();
+             let name = AvmString::new(context.gc(), do_abc.name.decode(reader.encoding()));
+ 
+             match Avm2::do_abc(
+@@ -774,7 +774,7 @@ impl<'gc> MovieClip<'gc> {
+         }
+ 
+         let mc = context.gc();
+-        let library = context.library.library_for_movie_mut(self.movie());
++        let mut library = context.library.library_for_movie_mut(self.movie(), context.gc());
+ 
+         for asset in exported_assets {
+             let name = asset.name.decode(reader.encoding());
+@@ -1513,8 +1513,8 @@ impl<'gc> MovieClip<'gc> {
+         }
+ 
+         let movie = self.movie();
+-        let library = context.library.library_for_movie_mut(movie);
+-        match library.instantiate_by_id(id, context.gc_context) {
++        let child = context.library.library_for_movie_mut(movie, context.gc()).instantiate_by_id(id, context.gc_context);
++        match child {
+             Some(child) => {
+                 // Remove previous child from children list,
+                 // and add new child onto front of the list.
+@@ -3157,6 +3157,8 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
+             options.set(HitTestOptions::SKIP_MASK, self.maskee().is_none());
+ 
+             let mut found_propagate = None;
++            let hit_area = self.hit_area();
++            let pick_children = hit_area.is_none() || self.raw_container().mouse_children();
+ 
+             let mut clip_layers = self
+                 .iter_render_list()
+@@ -3179,11 +3181,11 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
+             let interactive = self
+                 .iter_render_list()
+                 .rev()
+-                .filter(|child| child.as_interactive().is_some());
++                .filter(|child| pick_children && child.as_interactive().is_some());
+             let non_interactive = self
+                 .iter_render_list()
+                 .rev()
+-                .filter(|child| child.as_interactive().is_none());
++                .filter(|child| hit_area.is_none() && child.as_interactive().is_none());
+ 
+             for child in interactive.into_iter().chain(non_interactive) {
+                 // Mask children are not clickable
+@@ -3240,10 +3242,19 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
+ 
+                 match res {
+                     Avm2MousePick::Hit(_) => {
+-                        return res.combine_with_parent(self.into());
++                        let combined = res.combine_with_parent(self.into());
++                        // A child may receive its own events, but an event absorbed by
++                        // this clip is governed by its explicit hit area.
++                        if hit_area.is_none()
++                            || matches!(combined, Avm2MousePick::Hit(target) if !InteractiveObject::ptr_eq(target, this))
++                        {
++                            return combined;
++                        }
+                     }
+                     Avm2MousePick::PropagateToParent => {
+-                        found_propagate = Some(res);
++                        if hit_area.is_none() {
++                            found_propagate = Some(res);
++                        }
+                     }
+                     Avm2MousePick::Miss => {}
+                 }
+@@ -3254,6 +3265,22 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
+                 return propagate.combine_with_parent(self.into());
+             }
+ 
++            if let Some(area) = hit_area {
++                let area_point = if area.parent().is_some() {
++                    point
++                } else {
++                    local_matrix * point
++                };
++                // The area may be invisible and may lie outside the owner's bounds.
++                return if !area.hit_test_shape(context, area_point, HitTestOptions::SKIP_MASK) {
++                    Avm2MousePick::Miss
++                } else if self.mouse_enabled() {
++                    Avm2MousePick::Hit(this)
++                } else {
++                    Avm2MousePick::PropagateToParent
++                };
++            }
++
+             // Check drawing, because this selects the current clip, it must have mouse enabled
+             if self.world_bounds(BoundsMode::Engine).contains(point)
+                 && let Some(drawing) = self.drawing()
+@@ -3618,7 +3645,7 @@ impl<'gc, 'a> MovieClipShared<'gc> {
+         reader: &mut SwfStream<'a>,
+     ) -> Result<(), Error> {
+         let mc = context.gc();
+-        let library = self.library_mut(context);
++        let mut library = self.library_mut(context);
+         let (id, jpeg_data) = reader.read_define_bits()?;
+         let jpeg_tables = library.jpeg_tables();
+         let jpeg_data =
+@@ -4036,7 +4063,8 @@ impl<'gc, 'a> MovieClipShared<'gc> {
+             })
+             .collect::<HashMap<AvmString<'gc>, (CharacterId, Character<'gc>)>>();
+ 
+-        let self_library = self.library_mut(context);
++        drop(importer_library);
++        let mut self_library = self.library_mut(context);
+         for (name, (id, character)) in exported_from_importer {
+             if self_library.character_by_id(id).is_none() {
+                 self_library.register_character(id, character);
+@@ -4062,7 +4090,7 @@ impl<'gc, 'a> MovieClipShared<'gc> {
+         movie: SwfMovie<'gc>,
+     ) {
+         let mc = context.gc();
+-        let library = context.library.library_for_movie_mut(movie);
++        let mut library = context.library.library_for_movie_mut(movie, context.gc());
+         library.register_export(id, name);
+ 
+         // TODO: do other types of Character need to know their exported name?
+@@ -4102,10 +4130,13 @@ impl<'gc, 'a> MovieClipShared<'gc> {
+                 tracing::debug!("register_export asset: {} (ID: {})", name, export.id);
+ 
+                 if let Some(parent) = importer_movie {
+-                    let parent_library = context.library.library_for_movie_mut(parent);
+-
+-                    if let Some(id) = parent_library.character_id_by_import_name(&name) {
+-                        parent_library.register_character(id, character);
++                    let id = {
++                        let mut library = context.library.library_for_movie_mut(parent, context.gc());
++                        library.character_id_by_import_name(&name).inspect(|&id| {
++                            library.register_character(id, character);
++                        })
++                    };
++                    if let Some(id) = id {
+ 
+                         Self::register_export(context, id, name, parent);
+                         tracing::debug!(
+@@ -4358,22 +4389,17 @@ impl<'gc, 'a> MovieClip<'gc> {
+ 
+             let movie = self.movie();
+ 
+-            let library = activation.context.library.library_for_movie_mut(movie);
+-            let domain = library.avm2_domain();
++            let domain = activation.context.library.library_for_movie_mut(movie, activation.gc()).avm2_domain();
+ 
+             for (class_name, id) in eager_tags.symbolclass_names {
+                 let name = AvmString::new(activation.gc(), class_name);
+                 match Avm2::lookup_class_for_character(&mut activation, self, domain, name, id) {
+                     Ok(class_object) => {
+-                        activation
+-                            .context
+-                            .library
+-                            .avm2_class_registry_mut()
+-                            .set_class_symbol(class_object.inner_class_definition(), movie, id);
++                        class_object.inner_class_definition().set_library_symbol(activation.gc(), movie, id);
+ 
+-                        let library = activation.context.library.library_for_movie_mut(movie);
++                        let character = activation.context.library.library_for_movie_mut(movie, activation.gc()).character_by_id(id);
+ 
+-                        match library.character_by_id(id) {
++                        match character {
+                             Some(Character::EditText(edit_text)) => {
+                                 edit_text.set_avm2_class(activation.gc(), class_object)
+                             }
+@@ -4419,8 +4445,8 @@ impl<'gc, 'a> MovieClip<'gc> {
+ 
+                                 let instantiated = self.instantiate(activation.gc());
+ 
+-                                let library =
+-                                    activation.context.library.library_for_movie_mut(movie);
++                                let mut library =
++                                    activation.context.library.library_for_movie_mut(movie, activation.gc());
+ 
+                                 library.register_character(id, Character::MovieClip(instantiated));
+                             }
+@@ -4746,7 +4772,7 @@ struct EagerTags {
+ 
+ impl<'gc> MovieClipShared<'gc> {
+     fn empty(movie: SwfMovie<'gc>) -> Self {
+-        let mut s = Self::with_data(0, movie, SwfSlice::empty(movie), 1, None, None);
++        let mut s = Self::with_data(0, movie, crate::tag_utils::empty_slice(movie), 1, None, None);
+ 
+         *s.preload_progress.cur_preload_frame.get_mut() = s.header_frames + 1;
+ 
+@@ -4796,12 +4822,12 @@ impl<'gc> MovieClipShared<'gc> {
+         self.movie
+     }
+ 
+-    fn library<'a>(&self, context: &'a UpdateContext<'gc>) -> Option<&'a MovieLibrary<'gc>> {
++    fn library<'a>(&self, context: &'a UpdateContext<'gc>) -> Option<std::cell::Ref<'gc, MovieLibrary<'gc>>> {
+         context.library.library_for_movie(self.movie())
+     }
+ 
+-    fn library_mut<'a>(&self, context: &'a mut UpdateContext<'gc>) -> &'a mut MovieLibrary<'gc> {
+-        context.library.library_for_movie_mut(self.movie())
++    fn library_mut<'a>(&self, context: &'a mut UpdateContext<'gc>) -> std::cell::RefMut<'gc, MovieLibrary<'gc>> {
++        context.library.library_for_movie_mut(self.movie(), context.gc())
+     }
+ 
+     fn take_eager_tags(&self, frame: FrameNumber) -> Option<EagerTags> {
+diff --git a/core/src/display_object/text.rs b/core/src/display_object/text.rs
+index 2dbcb48..e471f90 100644
+--- a/core/src/display_object/text.rs
++++ b/core/src/display_object/text.rs
+@@ -121,7 +121,7 @@ impl<'gc> TDisplayObject<'gc> for Text<'gc> {
+     fn replace_with(self, context: &mut UpdateContext<'gc>, id: CharacterId) {
+         if let Some(new_text) = context
+             .library
+-            .library_for_movie_mut(self.movie())
++            .library_for_movie_mut(self.movie(), context.gc())
+             .get_text(id)
+         {
+             self.set_shared(context, new_text.0.shared.get());
+diff --git a/core/src/display_object.rs b/core/src/display_object.rs
+index d7b961d..88d02da 100644
+--- a/core/src/display_object.rs
++++ b/core/src/display_object.rs
+@@ -1000,7 +1000,15 @@ pub fn render_base<'gc>(
+         None
+     };
+ 
+-    let cache_info = if context.use_bitmap_cache && this.is_bitmap_cached() {
++    let drawing_filtered_text = !context.use_bitmap_cache
++        && context.is_offscreen
++        && matches!(context.untransformed_source, Some(source) if DisplayObject::ptr_eq(source, this))
++        && this.as_edit_text().is_some()
++        && !this.filters().is_empty();
++    let cache_info = if (context.use_bitmap_cache && this.is_bitmap_cached()) || drawing_filtered_text {
++        // Offscreen text is drawn in destination bitmap coordinates. Keep its
++        // temporary cache separate from the one used by the stage.
++        let mut text_cache = drawing_filtered_text.then(BitmapCache::default);
+         let mut cache_info: Option<DrawCacheInfo> = None;
+         let base_transform = context.transform_stack.transform();
+         let bounds: Rectangle<Twips> = this.render_bounds_with_transform(
+@@ -1013,7 +1021,9 @@ pub fn render_base<'gc>(
+         let swf_version = this.swf_version();
+         filters.retain(|f| !f.impotent());
+ 
+-        if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
++        let base = this.base();
++        let mut stage_cache = base.bitmap_cache_mut();
++        if let Some(cache) = text_cache.as_mut().or(stage_cache.as_mut()) {
+             let width = bounds.width().to_pixels().ceil().max(0.0);
+             let height = bounds.height().to_pixels().ceil().max(0.0);
+             if width <= u16::MAX as f64 && height <= u16::MAX as f64 {
+@@ -1028,7 +1038,9 @@ pub fn render_base<'gc>(
+                 let stage_matrix = context.stage.view_matrix();
+                 for filter in &mut filters {
+                     // Scaling is done by *stage view matrix* only, nothing in-between
+-                    filter.scale(stage_matrix.a, stage_matrix.d);
++                    if !drawing_filtered_text {
++                        filter.scale(stage_matrix.a, stage_matrix.d);
++                    }
+                     filter_rect = filter.calculate_dest_rect(filter_rect);
+                 }
+                 let filter_rect = Rectangle {
+diff --git a/core/src/html/layout/context.rs b/core/src/html/layout/context.rs
+index 0397a5a..8785300 100644
+--- a/core/src/html/layout/context.rs
++++ b/core/src/html/layout/context.rs
+@@ -1,7 +1,7 @@
+ use crate::context::{RenderContext, UpdateContext};
+ use crate::font::{DefaultFont, Font, FontType};
+ use gc_arena::Mutation;
+-use ruffle_common::tag_utils::SwfMovie;
++use crate::tag_utils::SwfMovie;
+ 
+ /// Provides access to the font resolution operations needed to lay out text,
+ /// common to both `UpdateContext` and `RenderContext`.
+diff --git a/core/src/html/text_format.rs b/core/src/html/text_format.rs
+index d5942ad..85bb4da 100644
+--- a/core/src/html/text_format.rs
++++ b/core/src/html/text_format.rs
+@@ -199,7 +199,7 @@ impl TextFormat {
+     ) -> Self {
+         let encoding = swf_movie.encoding();
+         let swf_version = swf_movie.version();
+-        let movie_library = context.library.library_for_movie_mut(swf_movie);
++        let movie_library = context.library.library_for_movie_mut(swf_movie, context.gc());
+         let font = et.font_id().and_then(|fid| movie_library.get_font(fid));
+         let font_class = et
+             .font_class()
+diff --git a/core/src/library.rs b/core/src/library.rs
+index b89702e..0b3965d 100644
+--- a/core/src/library.rs
++++ b/core/src/library.rs
+@@ -1,13 +1,15 @@
+ use crate::avm1::{PropertyMap as Avm1PropertyMap, PropertyMap};
+-use crate::avm2::{Class as Avm2Class, Domain as Avm2Domain};
++use crate::avm2::Domain as Avm2Domain;
+ use crate::backend::audio::SoundHandle;
++use crate::bitmap::bitmap_data::ColdBitmapWeak;
+ use crate::character::Character;
+ 
+ use crate::display_object::{Bitmap, Graphic, MorphShape, Text};
+ use crate::font::{Font, FontDescriptor, FontLike, FontQuery, FontType};
+ use crate::prelude::*;
+ use crate::string::AvmString;
+-use crate::tag_utils::SwfMovie;
++use crate::tag_utils::{SwfMovie, SwfMovieData, SwfMovieWeak};
++use std::cell::{Ref, RefMut};
+ use gc_arena::{Collect, Mutation};
+ use ruffle_render::backend::RenderBackend;
+ use ruffle_render::bitmap::BitmapHandle;
+@@ -19,76 +21,6 @@ use crate::font::DefaultFont;
+ use fnv::{FnvHashMap, FnvHashSet};
+ use std::collections::HashMap;
+ 
+-#[derive(Clone, Collect)]
+-#[collect(no_drop)]
+-struct MovieSymbol<'gc>(SwfMovie<'gc>, CharacterId);
+-
+-/// The mappings between class objects and library characters defined by
+-/// `SymbolClass`.
+-#[derive(Collect)]
+-#[collect(no_drop)]
+-pub struct Avm2ClassRegistry<'gc> {
+-    /// A list of AVM2 class objects and the character IDs they are expected to
+-    /// instantiate.
+-    class_map: HashMap<Avm2Class<'gc>, MovieSymbol<'gc>>,
+-}
+-
+-impl Default for Avm2ClassRegistry<'_> {
+-    fn default() -> Self {
+-        Self::new()
+-    }
+-}
+-
+-impl<'gc> Avm2ClassRegistry<'gc> {
+-    pub fn new() -> Self {
+-        Self {
+-            class_map: HashMap::new(),
+-        }
+-    }
+-
+-    /// Retrieve the library symbol for a given AVM2 class object.
+-    ///
+-    /// A value of `None` indicates that this AVM2 class is not associated with
+-    /// a library symbol.
+-    pub fn class_symbol(&self, class_def: Avm2Class<'gc>) -> Option<(SwfMovie<'gc>, CharacterId)> {
+-        match self.class_map.get(&class_def) {
+-            Some(MovieSymbol(movie, symbol)) => Some((*movie, *symbol)),
+-            None => None,
+-        }
+-    }
+-
+-    /// Associate an AVM2 class definition with a given library symbol.
+-    pub fn set_class_symbol(
+-        &mut self,
+-        class_def: Avm2Class<'gc>,
+-        movie: SwfMovie<'gc>,
+-        symbol: CharacterId,
+-    ) {
+-        if let Some(old) = self.class_map.get(&class_def) {
+-            if SwfMovie::ptr_eq(&movie, &old.0) && symbol != old.1 {
+-                // Flash player actually allows using the same class in multiple SymbolClass
+-                // entries in the same swf, with *different* symbol ids. Whichever one
+-                // is processed first will *win*, and the second one will be ignored.
+-                // We still log a warning, since we wouldn't expect this to happen outside
+-                // of deliberately crafted SWFs.
+-                tracing::warn!(
+-                    "Tried to overwrite class {:?} id={:?} with symbol id={:?} from same movie",
+-                    class_def,
+-                    old.1,
+-                    symbol,
+-                );
+-            }
+-            // If we're trying to overwrite the class with a symbol from a *different* SwfMovie,
+-            // then just ignore it. This handles the case where a Loader has a class that shadows
+-            // a class in the main swf (possibly with a different ApplicationDomain). This will
+-            // result in the original class from the parent being used, even when the child swf
+-            // instantiates the clip on the timeline.
+-            return;
+-        }
+-        self.class_map.insert(class_def, MovieSymbol(movie, symbol));
+-    }
+-}
+-
+ /// Symbol library for a single given SWF.
+ #[derive(Collect)]
+ #[collect(no_drop)]
+@@ -373,36 +305,18 @@ impl ruffle_render::bitmap::BitmapSource for MovieLibrarySource<'_, '_> {
+     }
+ }
+ 
+-#[derive(Collect)]
+-#[collect(no_drop)]
+-struct MovieLibraries<'gc>(HashMap<SwfMovie<'gc>, MovieLibrary<'gc>>);
+-
+-impl<'gc> MovieLibraries<'gc> {
+-    fn new() -> Self {
+-        Self(HashMap::new())
+-    }
+-
+-    fn get(&self, key: SwfMovie<'gc>) -> Option<&MovieLibrary<'gc>> {
+-        self.0.get(&key)
+-    }
+-
+-    fn get_or_insert_mut(&mut self, movie: SwfMovie<'gc>) -> &mut MovieLibrary<'gc> {
+-        self.0
+-            .entry(movie)
+-            .or_insert_with(|| MovieLibrary::new(movie))
+-    }
+-
+-    fn known_movies(&self) -> impl Iterator<Item = SwfMovie<'gc>> {
+-        self.0.keys().copied()
+-    }
+-}
+-
+ /// Symbol library for multiple movies.
+ #[derive(Collect)]
+ #[collect(no_drop)]
+ pub struct Library<'gc> {
+-    /// All the movie libraries.
+-    movie_libraries: MovieLibraries<'gc>,
++    /// Weak index for diagnostics. Movies own their symbol libraries.
++    movie_libraries: Vec<SwfMovieWeak<'gc>>,
++    cold_bitmaps: Vec<ColdBitmapWeak<'gc>>,
++    cold_bitmap_cursor: usize,
++
++    /// Weak references to recent large SWF buffers, shared only when the bytes match.
++    #[collect(require_static)]
++    shared_movie_data: Vec<std::sync::Weak<Vec<u8>>>,
+ 
+     /// A cache of seen device fonts.
+     // TODO: Descriptors shouldn't be stored in fonts. Fonts should be a list that we iterate and ask "do you match". A font can have zero or many names.
+@@ -424,36 +338,75 @@ pub struct Library<'gc> {
+ 
+     /// The cached list of implementations per default font.
+     default_font_cache: FnvHashMap<(DefaultFont, bool, bool), Vec<Font<'gc>>>,
+-
+-    /// A list of the symbols associated with specific AVM2 constructor
+-    /// prototypes.
+-    avm2_class_registry: Avm2ClassRegistry<'gc>,
+ }
+ 
+ impl<'gc> Library<'gc> {
+     pub fn empty() -> Self {
+         Self {
+-            movie_libraries: MovieLibraries::new(),
++            movie_libraries: Vec::new(),
++            cold_bitmaps: Vec::new(),
++            cold_bitmap_cursor: 0,
++            shared_movie_data: Vec::new(),
+             device_fonts: Default::default(),
+             global_fonts: Default::default(),
+             font_lookup_cache: Default::default(),
+             font_sort_cache: Default::default(),
+             default_font_names: Default::default(),
+             default_font_cache: Default::default(),
+-            avm2_class_registry: Default::default(),
+         }
+     }
+ 
+-    pub fn library_for_movie(&self, movie: SwfMovie<'gc>) -> Option<&MovieLibrary<'gc>> {
+-        self.movie_libraries.get(movie)
++    pub(crate) fn track_cold_bitmap(&mut self, bitmap: ColdBitmapWeak<'gc>) {
++        const MAX_TRACKED: usize = 8192;
++        if self.cold_bitmaps.len() == MAX_TRACKED {
++            self.cold_bitmaps.retain(|entry| !entry.is_dropped());
++        }
++        if self.cold_bitmaps.len() < MAX_TRACKED {
++            self.cold_bitmaps.push(bitmap);
++        }
+     }
+ 
+-    pub fn library_for_movie_mut(&mut self, movie: SwfMovie<'gc>) -> &mut MovieLibrary<'gc> {
+-        self.movie_libraries.get_or_insert_mut(movie)
++    pub(crate) fn pack_idle_bitmap(&mut self, mc: &Mutation<'gc>) {
++        const MAX_SCAN: usize = 256;
++        for _ in 0..self.cold_bitmaps.len().min(MAX_SCAN) {
++            self.cold_bitmap_cursor %= self.cold_bitmaps.len();
++            let entry = self.cold_bitmaps[self.cold_bitmap_cursor];
++            if entry.is_dropped() {
++                self.cold_bitmaps.swap_remove(self.cold_bitmap_cursor);
++            } else {
++                self.cold_bitmap_cursor += 1;
++                if entry.pack_if_idle(mc) {
++                    break;
++                }
++            }
++        }
+     }
+ 
+-    pub fn known_movies(&self) -> impl Iterator<Item = SwfMovie<'gc>> {
+-        self.movie_libraries.known_movies()
++    pub fn share_movie_data(&mut self, movie: &mut SwfMovieData) {
++        if movie.data().len() >= 64 * 1024 {
++            movie.share_data(&mut self.shared_movie_data);
++        }
++    }
++
++    pub fn library_for_movie(&self, movie: SwfMovie<'gc>) -> Option<Ref<'gc, MovieLibrary<'gc>>> {
++        movie.library().map(|library| library.borrow())
++    }
++
++    pub fn library_for_movie_mut(
++        &mut self,
++        movie: SwfMovie<'gc>,
++        mc: &Mutation<'gc>,
++    ) -> RefMut<'gc, MovieLibrary<'gc>> {
++        let library = movie.library().unwrap_or_else(|| {
++            self.movie_libraries.retain(|movie| !movie.is_dropped());
++            self.movie_libraries.push(movie.downgrade());
++            movie.init_library(mc)
++        });
++        library.borrow_mut(mc)
++    }
++
++    pub fn known_movies<'a>(&'a self, mc: &'a Mutation<'gc>) -> impl Iterator<Item = SwfMovie<'gc>> + 'a {
++        self.movie_libraries.iter().filter_map(|movie| movie.upgrade(mc))
+     }
+ 
+     /// Returns the default Font implementations behind the built in names (ie `_sans`)
+@@ -713,16 +666,6 @@ impl<'gc> Library<'gc> {
+         self.global_fonts.register(font);
+     }
+ 
+-    /// Get the AVM2 class registry.
+-    pub fn avm2_class_registry(&self) -> &Avm2ClassRegistry<'gc> {
+-        &self.avm2_class_registry
+-    }
+-
+-    /// Mutate the AVM2 class registry.
+-    pub fn avm2_class_registry_mut(&mut self) -> &mut Avm2ClassRegistry<'gc> {
+-        &mut self.avm2_class_registry
+-    }
+-
+     /// Evicts cached font resources that haven't been used, across all device
+     /// fonts. Meant to be called once per rendered frame.
+     pub fn sweep_font_caches(&self) {
+diff --git a/core/src/loader.rs b/core/src/loader.rs
+index 33adb41..21af7e8 100644
+--- a/core/src/loader.rs
++++ b/core/src/loader.rs
+@@ -39,7 +39,8 @@ use crate::tag_utils::{SwfMovie, SwfMovieData};
+ use crate::vminterface::Instantiator;
+ use chardetng::EncodingDetector;
+ use encoding_rs::{UTF_8, WINDOWS_1252};
+-use gc_arena::Collect;
++use futures_util::future::{AbortHandle, Abortable};
++use gc_arena::{Collect, Gc};
+ use indexmap::IndexMap;
+ use ruffle_common::tag_utils::LoadBytesInfo;
+ use ruffle_macros::istr;
+@@ -249,6 +250,30 @@ impl<'gc> LoadManager<'gc> {
+         self.0.remove(handle);
+     }
+ 
++
++    /// Stop an AVM2 Loader's unfinished URL download. Plain unload does not
++    /// close the stream; its caller may still close it or wait for completion.
++    pub fn cancel_pending_avm2_download(&mut self, info: LoaderInfoObject<'gc>) -> bool {
++        let handle = self.0.iter().find_map(|(handle, loader)| {
++            if let MovieLoaderVMData::Avm2 { loader_info, .. } = loader.vm_data
++                && Gc::ptr_eq(loader_info.0, info.0)
++                && loader.loader_status == LoaderStatus::Pending
++                && loader.download_abort.is_some()
++            {
++                Some(handle)
++            } else {
++                None
++            }
++        });
++
++        let Some(handle) = handle else {
++            return false;
++        };
++        let loader = self.0.remove(handle).expect("active download");
++        loader.download_abort.expect("abortable download").abort();
++        true
++    }
++
+     /// Retrieve a loader by handle.
+     pub fn get_loader(&self, handle: LoaderHandle) -> Option<&MovieLoader<'gc>> {
+         self.0.get(handle)
+@@ -314,16 +339,33 @@ impl<'gc> LoadManager<'gc> {
+             }
+         }
+ 
++        let (download_abort, registration) = match vm_data {
++            MovieLoaderVMData::Avm2 { .. } => {
++                let (abort, registration) = AbortHandle::new_pair();
++                (Some(abort), Some(registration))
++            }
++            MovieLoaderVMData::Avm1 { .. } => (None, None),
++        };
+         let loader = MovieLoader {
+             self_handle: None,
+             target_clip,
+             vm_data,
+             loader_status: LoaderStatus::Pending,
+             movie: None,
++            download_abort,
+         };
+         let handle = self.add_loader(loader);
+         let loader = self.get_loader_mut(handle).unwrap();
+-        loader.movie_loader(player, request, loader_url)
++        let future = loader.movie_loader(player, request, loader_url);
++        match registration {
++            Some(registration) => Box::pin(async move {
++                match Abortable::new(future, registration).await {
++                    Ok(result) => result,
++                    Err(_) => Ok(()),
++                }
++            }),
++            None => future,
++        }
+     }
+ 
+     pub fn load_asset_movie(
+@@ -370,7 +412,7 @@ impl<'gc> LoadManager<'gc> {
+                             tracing::debug!("Preloading swf to run exports {:?}", url);
+ 
+                             // Create library for exports before preloading
+-                            uc.library.library_for_movie_mut(clip.movie());
++                            uc.library.library_for_movie_mut(clip.movie(), uc.gc());
+                             let res = clip.preload(uc, &mut execution_limit);
+                             tracing::debug!(
+                                 "Preloaded swf to run exports result {:?} {}",
+@@ -412,6 +454,7 @@ impl<'gc> LoadManager<'gc> {
+             vm_data,
+             loader_status: LoaderStatus::Pending,
+             movie: None,
++            download_abort: None,
+         };
+         let handle = context.load_manager.add_loader(loader);
+         MovieLoader::movie_loader_bytes(handle, context, loader_url, bytes)
+@@ -597,6 +640,9 @@ pub struct MovieLoader<'gc> {
+     /// completed and we expect the Player to periodically tick preload
+     /// until loading completes.
+     movie: Option<SwfMovie<'gc>>,
++
++    #[collect(require_static)]
++    download_abort: Option<AbortHandle>,
+ }
+ 
+ impl<'gc> MovieLoader<'gc> {
+@@ -1711,6 +1757,7 @@ impl<'gc> MovieLoader<'gc> {
+                     load_bytes_info,
+                 )?;
+ 
++                uc.library.share_movie_data(&mut movie);
+                 if matches!(vm_data, MovieLoaderVMData::Avm1 { .. }) {
+                     // If AVM1 loads a SWF, that SWF is always interpreted as
+                     // AVM1, regardless of what it declares in its header.
+@@ -1733,8 +1780,10 @@ impl<'gc> MovieLoader<'gc> {
+             Some(Self {
+                 movie: old,
+                 loader_status,
++                download_abort,
+                 ..
+             }) => {
++                *download_abort = None;
+                 *loader_status = LoaderStatus::Parsing;
+                 *old = Some(movie)
+             }
+@@ -1777,9 +1826,7 @@ impl<'gc> MovieLoader<'gc> {
+ 
+         match sniffed_type {
+             ContentType::Swf => {
+-                let library = uc.library.library_for_movie_mut(movie);
+-
+-                library.set_avm2_domain(domain);
++                uc.library.library_for_movie_mut(movie, uc.gc()).set_avm2_domain(domain);
+ 
+                 if let Some(mc) = clip.as_movie_clip() {
+                     let loader_info = if let MovieLoaderVMData::Avm2 { loader_info, .. } = vm_data {
+@@ -1865,9 +1912,7 @@ impl<'gc> MovieLoader<'gc> {
+             ContentType::Gif | ContentType::Jpeg | ContentType::JpegXr | ContentType::Png => {
+                 let mut activation = Avm2Activation::from_nothing(uc);
+ 
+-                let library = activation.context.library.library_for_movie_mut(movie);
+-
+-                library.set_avm2_domain(domain);
++                activation.context.library.library_for_movie_mut(movie, activation.gc()).set_avm2_domain(domain);
+ 
+                 // This will construct AVM2-side objects even under AVM1, but it doesn't matter,
+                 // since Bitmap and BitmapData never have AVM1-side objects.
+@@ -2257,6 +2302,10 @@ impl<'gc> MovieLoader<'gc> {
+             None => return Err(Error::Cancelled),
+         };
+ 
++        let loader = uc.load_manager.get_loader_mut(handle).expect("active loader");
++        loader.download_abort = None;
++        loader.loader_status = LoaderStatus::Failed;
++
+         // If the SWF can't be loaded, the MovieClip enters the error state
+         if let Some(mc) = clip.as_movie_clip() {
+             MovieLoader::load_error_swf(mc, uc, swf_url);
+@@ -2298,9 +2347,6 @@ impl<'gc> MovieLoader<'gc> {
+             }
+         }
+ 
+-        let loader = uc.load_manager.get_loader_mut(handle).unwrap();
+-        loader.loader_status = LoaderStatus::Failed;
+-
+         Ok(())
+     }
+ 
+diff --git a/core/src/orphan_manager.rs b/core/src/orphan_manager.rs
+index a231dc0..caf6f8e 100644
+--- a/core/src/orphan_manager.rs
++++ b/core/src/orphan_manager.rs
+@@ -5,6 +5,8 @@ use crate::display_object::{DisplayObject, DisplayObjectWeak, TDisplayObject};
+ use gc_arena::{Collect, Mutation};
+ use std::rc::Rc;
+ 
++const CHUNK_SIZE: usize = 256;
++
+ /// The list of 'orphan' objects - these objects have no parent,
+ /// so we need to manually run their frames in `run_all_phases_avm2` to match
+ /// Flash's behavior. Clips are added to this list with `add_orphan_movie`.
+@@ -17,14 +19,11 @@ use std::rc::Rc;
+ #[derive(Collect)]
+ #[collect(no_drop)]
+ pub struct OrphanManager<'gc> {
+-    orphans: Rc<Vec<DisplayObjectWeak<'gc>>>,
++    // A snapshot retains the frame's ordering without copying the entire list on append.
++    chunks: Rc<Vec<Rc<Vec<DisplayObjectWeak<'gc>>>>>,
+ }
+ 
+ impl<'gc> OrphanManager<'gc> {
+-    fn orphans_mut(&mut self) -> &mut Vec<DisplayObjectWeak<'gc>> {
+-        Rc::make_mut(&mut self.orphans)
+-    }
+-
+     /// Adds a `MovieClip` to the orphan list. In AVM2, movies advance their
+     /// frames even when they are not on a display list. Unfortunately,
+     /// multiple SWFS rely on this behavior, so we need to match Flash's
+@@ -34,11 +33,19 @@ impl<'gc> OrphanManager<'gc> {
+         // Note: comparing pointers is correct because GcWeak keeps its allocation alive,
+         // so the pointers can't overlap by accident.
+         if self
+-            .orphans
++            .chunks
+             .iter()
++            .flat_map(|chunk| chunk.iter())
+             .all(|d| !std::ptr::eq(d.as_ptr(), dobj.as_ptr()))
+         {
+-            self.orphans_mut().push(dobj.downgrade());
++            let chunks = Rc::make_mut(&mut self.chunks);
++            if let Some(chunk) = chunks.last_mut()
++                && chunk.len() < CHUNK_SIZE
++            {
++                Rc::make_mut(chunk).push(dobj.downgrade());
++            } else {
++                chunks.push(Rc::new(vec![dobj.downgrade()]));
++            }
+         }
+     }
+ 
+@@ -46,13 +53,10 @@ impl<'gc> OrphanManager<'gc> {
+         context: &mut UpdateContext<'gc>,
+         mut f: impl FnMut(DisplayObject<'gc>, &mut UpdateContext<'gc>),
+     ) {
+-        // Clone the Rc before iterating over it. Any modifications must go through
+-        // `Rc::make_mut` in `orphan_objects_mut`, which will leave this `Rc` unmodified.
+-        // This ensures that any orphan additions/removals done by `f` will not affect
+-        // the iteration in this method.
+-        let orphan_objs: Rc<_> = context.orphan_manager.orphans.clone();
+-
+-        for orphan in orphan_objs.iter() {
++        // Nested frame callbacks may append or clean up entries. The snapshot
++        // keeps the original iteration order and still checks liveness per entry.
++        let chunks = context.orphan_manager.chunks.clone();
++        for orphan in chunks.iter().flat_map(|chunk| chunk.iter()) {
+             if let Some(dobj) = valid_orphan(*orphan, context.gc()) {
+                 f(dobj, context);
+             }
+@@ -63,7 +67,7 @@ impl<'gc> OrphanManager<'gc> {
+     /// that have been garbage collected, or are no longer orphans
+     /// (they've since acquired a parent).
+     pub fn cleanup_dead_orphans(&mut self, mc: &Mutation<'gc>) {
+-        self.orphans_mut().retain(|d| {
++        let keep = |d: &DisplayObjectWeak<'gc>| {
+             if let Some(dobj) = valid_orphan(*d, mc) {
+                 // All clips that become orphaned (have their parent removed, or start out with no parent)
+                 // get added to the orphan list. However, there's a distinction between clips
+@@ -89,6 +93,13 @@ impl<'gc> OrphanManager<'gc> {
+             } else {
+                 false
+             }
++        };
++        Rc::make_mut(&mut self.chunks).retain_mut(|chunk| {
++            // Keep unchanged chunks shared with any enclosing frame iteration.
++            if !chunk.iter().all(&keep) {
++                Rc::make_mut(chunk).retain(&keep);
++            }
++            !chunk.is_empty()
+         });
+     }
+ }
+@@ -96,7 +107,7 @@ impl<'gc> OrphanManager<'gc> {
+ impl<'gc> Default for OrphanManager<'gc> {
+     fn default() -> Self {
+         Self {
+-            orphans: Rc::new(Vec::new()),
++            chunks: Rc::new(Vec::new()),
+         }
+     }
+ }
+diff --git a/core/src/player.rs b/core/src/player.rs
+index 9322033..e14bfb9 100644
+--- a/core/src/player.rs
++++ b/core/src/player.rs
+@@ -335,6 +335,9 @@ pub struct Player {
+ 
+     run_state: RunState,
+     needs_render: bool,
++    completed_logic_frames: u32,
++    pressure_collection_active: bool,
++    returned_render_submissions: u32,
+ 
+     renderer: Box<dyn RenderBackend>,
+     audio: Box<dyn AudioBackend>,
+@@ -615,6 +618,74 @@ impl Player {
+         self.audio.tick();
+     }
+ 
++    /// Reclaim unreachable ActionScript objects and discard reusable renderer pools.
++    /// Call between player updates, when no code is borrowing the arena.
++    pub fn reclaim_unused_memory(&mut self) {
++        self.pressure_collection_active = false;
++        let mut arena = self.gc_arena.borrow_mut();
++        let before = arena.metrics().total_gc_count();
++        arena.finish_cycle();
++        let after = arena.metrics().total_gc_count();
++        tracing::info!(before, after, "Completed memory pressure collection");
++        self.renderer.trim_temporary_resources();
++    }
++
++    /// Advance one pressure collection with bounded allocation debt.
++    pub fn reclaim_memory_slice(&mut self) -> bool {
++        use gc_arena::arena::CollectionPhase;
++        const WORK_PER_TICK: f64 = 16_384.0;
++        self.pressure_collection_active = true;
++        let finished = {
++            let mut arena = self.gc_arena.borrow_mut();
++            let metrics = arena.metrics();
++            let debt = metrics.allocation_debt();
++            // While sleeping, build enough credit to start a cycle. Once
++            // active, cap the positive debt so existing allocations cannot
++            // turn this slice into an unbounded collection.
++            metrics.adjust_debt(WORK_PER_TICK - debt);
++            if metrics.allocation_debt() > 0.0 {
++                arena.cycle_debt();
++                arena.collection_phase() == CollectionPhase::Sleeping
++            } else {
++                false
++            }
++        };
++        if finished {
++            self.pressure_collection_active = false;
++            self.renderer.trim_temporary_resources();
++        }
++        finished
++    }
++
++    /// Compress at most one idle embedded bitmap between player updates.
++    pub fn pack_idle_bitmap(&mut self, seconds: usize, allow_work: bool) {
++        if crate::bitmap::bitmap_data::set_cold_bitmap_clock(seconds) && allow_work {
++            self.enter_arena_mut(|mc, root, _| root.library.pack_idle_bitmap(mc));
++        }
++    }
++
++    /// Begin incremental collection earlier for a player with a large live heap.
++    pub fn use_earlier_incremental_collection(&mut self) {
++        use gc_arena::metrics::Pacing;
++        self.gc_arena.borrow().metrics().set_pacing(Pacing {
++            sleep_factor: 0.125,
++            ..Pacing::DEFAULT
++        });
++    }
++
++    /// Account for heap growth from Rust buffers that the arena does not count.
++    /// Keep this supplemental collection work bounded per frame.
++    pub fn collect_for_heap_growth(&mut self, growth: usize) {
++        const BYTES_PER_UNIT: usize = 256;
++        const MAX_DEBT_PER_FRAME: usize = 16_384;
++        let work = (growth / BYTES_PER_UNIT).min(MAX_DEBT_PER_FRAME);
++        if work != 0 {
++            let mut arena = self.gc_arena.borrow_mut();
++            arena.metrics().adjust_debt(work as f64);
++            arena.cycle_debt();
++        }
++    }
++
+     pub fn time_til_next_timer(&self) -> Option<f64> {
+         self.time_til_next_timer
+     }
+@@ -2092,6 +2163,7 @@ impl Player {
+             }
+         });
+ 
++        self.completed_logic_frames = self.completed_logic_frames.wrapping_add(1);
+         self.needs_render = true;
+     }
+ 
+@@ -2152,9 +2224,33 @@ impl Player {
+         self.renderer
+             .submit_frame(background_color, commands, cache_draws);
+ 
++        self.returned_render_submissions = self.returned_render_submissions.wrapping_add(1);
+         self.needs_render = false;
+     }
+ 
++    pub fn frame_diagnostics(&self) -> (u32, u32) {
++        (
++            self.completed_logic_frames,
++            self.returned_render_submissions,
++        )
++    }
++
++    pub fn resource_diagnostics(&self) -> (usize, usize, usize) {
++        self.enter_arena(|mc, root, _| {
++            let mut buffers = std::collections::HashSet::new();
++            let mut library_count = 0;
++            let mut swf_bytes = 0;
++            for movie in root.library.known_movies(mc) {
++                library_count += 1;
++                let data = movie.data();
++                if !data.is_empty() && buffers.insert(data.as_ptr()) {
++                    swf_bytes += data.len();
++                }
++            }
++            (mc.metrics().total_gc_count(), library_count, swf_bytes)
++        })
++    }
++
+     /// The current frame of the main timeline, if available.
+     /// The first frame is frame 1.
+     pub fn current_frame(&self) -> Option<u16> {
+@@ -2451,7 +2547,9 @@ impl Player {
+         self.update_mouse_state(EnumSet::empty(), false, &mut false);
+ 
+         // GC
+-        self.gc_arena.borrow_mut().collect_debt();
++        if !self.pressure_collection_active {
++            self.gc_arena.borrow_mut().collect_debt();
++        }
+ 
+         rval
+     }
+@@ -3126,6 +3224,9 @@ impl PlayerBuilder {
+                     RunState::Suspended
+                 },
+                 needs_render: true,
++                completed_logic_frames: 0,
++                pressure_collection_active: false,
++                returned_render_submissions: 0,
+                 self_reference: self_ref.clone(),
+                 load_behavior: self.load_behavior,
+                 spoofed_url: self.spoofed_url.clone(),
+diff --git a/core/src/tag_utils.rs b/core/src/tag_utils.rs
+index 78e09a2..00f609d 100644
+--- a/core/src/tag_utils.rs
++++ b/core/src/tag_utils.rs
+@@ -3,7 +3,106 @@
+ use swf::{CharacterId, TagCode};
+ use thiserror::Error;
+ 
+-pub use ruffle_common::tag_utils::{SwfMovie, SwfMovieData, SwfMovieWeak, SwfSlice, SwfStream};
++use crate::library::MovieLibrary;
++use gc_arena::{Collect, Gc, GcWeak, Mutation};
++use gc_arena::lock::{OnceLock, RefLock};
++use std::{hash::{Hash, Hasher}, ops::Deref};
++use ruffle_common::tag_utils::SwfMovie as MovieDataHandle;
++pub use ruffle_common::tag_utils::{SwfMovieData, SwfSlice, SwfStream};
++
++#[derive(Clone, Copy, Debug, Collect)]
++#[collect(no_drop)]
++pub struct SwfMovie<'gc>(Gc<'gc, Movie<'gc>>);
++
++#[derive(Collect)]
++#[collect(no_drop)]
++struct Movie<'gc> {
++    data: MovieDataHandle<'gc>,
++    library: Gc<'gc, OnceLock<Gc<'gc, RefLock<MovieLibrary<'gc>>>>>,
++}
++
++impl std::fmt::Debug for Movie<'_> {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        self.data.fmt(f)
++    }
++}
++
++impl<'gc> SwfMovie<'gc> {
++    pub fn new(mc: &Mutation<'gc>, data: SwfMovieData) -> Self {
++        Self(Gc::new(mc, Movie {
++            data: MovieDataHandle::new(mc, data),
++            library: Gc::new(mc, OnceLock::new()),
++        }))
++    }
++
++    pub fn as_ptr(self) -> *const SwfMovieData {
++        self.0.data.as_ptr()
++    }
++
++    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
++        Gc::ptr_eq(this.0, other.0)
++    }
++
++    pub fn downgrade(self) -> SwfMovieWeak<'gc> {
++        SwfMovieWeak(Gc::downgrade(self.0))
++    }
++
++    pub(crate) fn library(self) -> Option<Gc<'gc, RefLock<MovieLibrary<'gc>>>> {
++        self.0.library.get().copied()
++    }
++
++    pub(crate) fn init_library(self, mc: &Mutation<'gc>) -> Gc<'gc, RefLock<MovieLibrary<'gc>>> {
++        let library = Gc::new(mc, RefLock::new(MovieLibrary::new(self)));
++        assert!(self.0.library.set(mc, library).is_ok());
++        library
++    }
++}
++
++impl Deref for SwfMovie<'_> {
++    type Target = SwfMovieData;
++
++    fn deref(&self) -> &Self::Target {
++        &self.0.as_ref().data
++    }
++}
++
++impl PartialEq for SwfMovie<'_> {
++    fn eq(&self, other: &Self) -> bool {
++        Self::ptr_eq(self, other)
++    }
++}
++
++impl Eq for SwfMovie<'_> {}
++
++impl Hash for SwfMovie<'_> {
++    fn hash<H: Hasher>(&self, state: &mut H) {
++        self.as_ptr().hash(state);
++    }
++}
++
++#[derive(Clone, Copy, Debug, Collect)]
++#[collect(no_drop)]
++pub struct SwfMovieWeak<'gc>(GcWeak<'gc, Movie<'gc>>);
++
++impl<'gc> SwfMovieWeak<'gc> {
++    pub fn upgrade(self, mc: &Mutation<'gc>) -> Option<SwfMovie<'gc>> {
++        self.0.upgrade(mc).map(SwfMovie)
++    }
++
++    pub(crate) fn is_dropped(self) -> bool {
++        self.0.is_dropped()
++    }
++}
++
++impl<'gc> From<SwfMovie<'gc>> for SwfSlice {
++    fn from(movie: SwfMovie<'gc>) -> Self {
++        Self::from(movie.0.data)
++    }
++}
++
++pub(crate) fn empty_slice(movie: SwfMovie<'_>) -> SwfSlice {
++    SwfSlice::empty(movie.0.data)
++}
+ 
+ #[derive(Error, Debug)]
+ pub enum Error {
+diff --git a/render/src/backend.rs b/render/src/backend.rs
+index 14581c3..3d3085d 100644
+--- a/render/src/backend.rs
++++ b/render/src/backend.rs
+@@ -26,6 +26,9 @@ pub struct BitmapCacheEntry {
+ }
+ 
+ pub trait RenderBackend: Any {
++    /// Drop reusable renderer caches. Live handles remain owned by their callers.
++    fn trim_temporary_resources(&mut self) {}
++
+     fn viewport_dimensions(&self) -> ViewportDimensions;
+     // Do not call this method directly - use `player.set_viewport_dimensions`,
+     // which will ensure that the stage is properly updated as well.
+@@ -80,6 +83,9 @@ pub trait RenderBackend: Any {
+         false
+     }
+ 
++    /// Render offscreen cache dependencies before drawing into a BitmapData.
++    fn render_bitmap_cache_entries(&mut self, _entries: Vec<BitmapCacheEntry>, _quality: StageQuality) {}
++
+     fn submit_frame(
+         &mut self,
+         clear: swf::Color,
+diff --git a/render/src/error.rs b/render/src/error.rs
+index 49b3977..2d4afb0 100644
+--- a/render/src/error.rs
++++ b/render/src/error.rs
+@@ -9,6 +9,9 @@ pub enum Error {
+     #[error("Bitmap texture is larger than the rendering device supports")]
+     TooLarge,
+ 
++    #[error("Unable to allocate bitmap pixels: {0}")]
++    BitmapAllocation(#[from] std::collections::TryReserveError),
++
+     #[error("Unknown bitmap format")]
+     UnknownType,
+ 
+diff --git a/render/src/utils.rs b/render/src/utils.rs
+index 571eaa7..e8c52e0 100644
+--- a/render/src/utils.rs
++++ b/render/src/utils.rs
+@@ -226,23 +226,12 @@ fn decode_jpeg(jpeg_data: &[u8], alpha_data: Option<&[u8]>) -> Result<Bitmap<'st
+         let alpha_data = decompress_zlib(alpha_data)?;
+ 
+         if alpha_data.len() == decoded_data.len() / 3 {
+-            let rgba: Vec<_> = decoded_data
+-                .as_chunks::<3>()
+-                .0
+-                .iter()
+-                .zip(alpha_data)
+-                .flat_map(|(rgb, a)| {
+-                    // The JPEG data should be premultiplied alpha, but it isn't in some incorrect
+-                    // SWFs (see #6893).
+-                    // This means 0% alpha pixels may have color and incorrectly show as visible.
+-                    // Flash Player clamps color to the alpha value to fix this case.
+-                    // Only applies to DefineBitsJPEG3; DefineBitsLossless does not seem to clamp.
+-                    let r = rgb[0].min(a);
+-                    let g = rgb[1].min(a);
+-                    let b = rgb[2].min(a);
+-                    [r, g, b, a]
+-                })
+-                .collect();
++            let mut rgba = Vec::new();
++            rgba.try_reserve_exact(alpha_data.len() * 4)?;
++            for (rgb, a) in decoded_data.as_chunks::<3>().0.iter().zip(alpha_data) {
++                // Flash clamps malformed premultiplied color components to alpha.
++                rgba.extend_from_slice(&[rgb[0].min(a), rgb[1].min(a), rgb[2].min(a), a]);
++            }
+             return Ok(Bitmap::new(
+                 metadata.width.into(),
+                 metadata.height.into(),
+diff --git a/render/wgpu/src/backend.rs b/render/wgpu/src/backend.rs
+index 0e6995e..7136a37 100644
+--- a/render/wgpu/src/backend.rs
++++ b/render/wgpu/src/backend.rs
+@@ -13,7 +13,6 @@ use crate::{
+     Descriptors, Error, QueueSyncHandle, RenderTarget, SwapChainTarget, Texture, as_texture,
+     format_list, get_backend_names,
+ };
+-use image::imageops::FilterType;
+ use ruffle_render::backend::{
+     BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderTarget,
+ };
+@@ -39,6 +38,47 @@ use tracing::instrument;
+ use wgpu::SubmissionIndex;
+ use wgpu_profiler::{GpuProfiler, GpuProfilerSettings};
+ 
++fn downsample_rgba(
++    source: &[u8],
++    width: u32,
++    height: u32,
++    new_width: u32,
++    new_height: u32,
++) -> Result<Vec<u8>, BitmapError> {
++    let output_bytes = (new_width as usize)
++        .checked_mul(new_height as usize)
++        .and_then(|pixels| pixels.checked_mul(4))
++        .ok_or(BitmapError::TooLarge)?;
++    let mut pixels = Vec::new();
++    pixels.try_reserve_exact(output_bytes)?;
++
++    // Source pixels are premultiplied. Keep all four channels in the same
++    // sampling region and avoid an input copy or a floating-point image.
++    let boundary = |index: u32, source_size: u32, target_size: u32| {
++        (u64::from(index) * u64::from(source_size) / u64::from(target_size)) as usize
++    };
++    for y in 0..new_height {
++        let top = boundary(y, height, new_height);
++        let bottom = boundary(y + 1, height, new_height);
++        for x in 0..new_width {
++            let left = boundary(x, width, new_width);
++            let right = boundary(x + 1, width, new_width);
++            let mut channels = [0u64; 4];
++            for row in top..bottom {
++                let offset = row * width as usize;
++                for pixel in source[(offset + left) * 4..(offset + right) * 4].chunks_exact(4) {
++                    for (sum, component) in channels.iter_mut().zip(pixel) {
++                        *sum += u64::from(*component);
++                    }
++                }
++            }
++            let count = (bottom - top) as u64 * (right - left) as u64;
++            pixels.extend(channels.map(|sum| ((sum + count / 2) / count) as u8));
++        }
++    }
++    Ok(pixels)
++}
++
+ /// Creates a wgpu instance with Ruffle's required configuration.
+ ///
+ /// This disables indirect call validation because wgpu's validation runs a compute
+@@ -72,6 +112,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
+     pub(crate) descriptors: Arc<Descriptors>,
+     target: T,
+     surface: Surface,
++    stage_sample_limit: u32,
+     meshes: Vec<Mesh>,
+     shape_tessellator: ShapeTessellator,
+     // This is currently unused - we just store it to report in
+@@ -217,6 +258,10 @@ impl WgpuRenderBackend<crate::target::TextureTarget> {
+ }
+ 
+ impl<T: RenderTarget> WgpuRenderBackend<T> {
++    pub fn set_stage_sample_limit(&mut self, limit: u32) {
++        self.stage_sample_limit = limit.max(1);
++    }
++
+     pub fn new(descriptors: Arc<Descriptors>, target: T) -> Result<Self, Error> {
+         if target.width() > descriptors.limits.max_texture_dimension_2d
+             || target.height() > descriptors.limits.max_texture_dimension_2d
+@@ -271,6 +316,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
+             descriptors,
+             target,
+             surface,
++            stage_sample_limit: u32::MAX,
+             meshes: Vec::new(),
+             shape_tessellator: ShapeTessellator::new(),
+             viewport_scale_factor: 1.0,
+@@ -356,30 +402,21 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
+         }
+     }
+ 
+-    fn clamp_bitmap(&self, bitmap: &mut Bitmap) -> bool {
++    fn clamp_bitmap(&self, bitmap: &mut Bitmap) -> Result<bool, BitmapError> {
+         let max_size = self.descriptors.limits.max_texture_dimension_2d;
+-        if bitmap.width() > max_size || bitmap.height() > max_size {
+-            let image =
+-                image::RgbaImage::from_raw(bitmap.width(), bitmap.height(), bitmap.data().to_vec())
+-                    .expect("Width and height of bitmap must match bitmap data");
+-
+-            let ratio = bitmap.width() as f32 / bitmap.height() as f32;
+-            let mut width = bitmap.width();
+-            let mut height = bitmap.height();
+-            if width > max_size {
+-                width = max_size;
+-                height = (max_size as f32 / ratio) as u32;
+-            }
+-            if height > max_size {
+-                height = max_size;
+-                width = (max_size as f32 * ratio) as u32;
+-            }
+-            let resized = image::imageops::resize(&image, width, height, FilterType::CatmullRom);
+-            *bitmap = Bitmap::new(width, height, BitmapFormat::Rgba, resized.into_raw());
+-            true
+-        } else {
+-            false
++        let (width, height) = (bitmap.width(), bitmap.height());
++        let longest = width.max(height);
++        if longest <= max_size || width == 0 || height == 0 {
++            return Ok(false);
+         }
++
++        let scaled_dimension = |dimension: u32| {
++            (u64::from(dimension) * u64::from(max_size) / u64::from(longest)).max(1) as u32
++        };
++        let (new_width, new_height) = (scaled_dimension(width), scaled_dimension(height));
++        let pixels = downsample_rgba(bitmap.data(), width, height, new_width, new_height)?;
++        *bitmap = Bitmap::new(new_width, new_height, BitmapFormat::Rgba, pixels);
++        Ok(true)
+     }
+ 
+     pub fn descriptors(&self) -> &Arc<Descriptors> {
+@@ -445,12 +482,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+         );
+         self.target.resize(&self.descriptors.device, width, height);
+ 
+-        self.surface = Surface::new(
++        self.surface = Surface::with_sample_limit(
+             &self.descriptors,
+             self.surface.quality(),
+             width,
+             height,
+             self.target.format(),
++            self.stage_sample_limit,
+         );
+ 
+         self.viewport_scale_factor = dimensions.scale_factor;
+@@ -506,12 +544,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+     }
+ 
+     fn set_quality(&mut self, quality: StageQuality) {
+-        self.surface = Surface::new(
++        self.surface = Surface::with_sample_limit(
+             &self.descriptors,
+             quality,
+             self.surface.size().width,
+             self.surface.size().height,
+             self.target.format(),
++            self.stage_sample_limit,
+         );
+     }
+ 
+@@ -545,27 +584,18 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+     }
+ 
+     #[instrument(level = "debug", skip_all)]
+-    fn submit_frame(
+-        &mut self,
+-        clear: Color,
+-        commands: CommandList,
+-        cache_entries: Vec<BitmapCacheEntry>,
+-    ) {
+-        let Some(frame_output) = self.target.get_next_texture() else {
+-            // Attempt to recreate the swap chain in this case.
+-            self.target.resize(
+-                &self.descriptors.device,
+-                self.target.width(),
+-                self.target.height(),
+-            );
+-            return;
+-        };
++    fn trim_temporary_resources(&mut self) {
++        // Pool entries still in use retain their textures independently.
++        self.texture_pool = TexturePool::new();
++        self.offscreen_texture_pool = TexturePool::new();
++    }
+ 
++    fn render_bitmap_cache_entries(&mut self, cache_entries: Vec<BitmapCacheEntry>, quality: StageQuality) {
+         for entry in cache_entries {
+             let texture = as_texture(&entry.handle);
+             let surface = Surface::new(
+                 &self.descriptors,
+-                self.surface.quality(),
++                quality,
+                 texture.texture.width(),
+                 texture.texture.height(),
+                 wgpu::TextureFormat::Rgba8Unorm,
+@@ -643,6 +673,25 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+             // but its hundreds of children each have their own bitmap caches).
+             self.active_frame.maybe_flush(&self.descriptors);
+         }
++    }
++
++    fn submit_frame(
++        &mut self,
++        clear: Color,
++        commands: CommandList,
++        cache_entries: Vec<BitmapCacheEntry>,
++    ) {
++        let Some(frame_output) = self.target.get_next_texture() else {
++            // Attempt to recreate the swap chain in this case.
++            self.target.resize(
++                &self.descriptors.device,
++                self.target.width(),
++                self.target.height(),
++            );
++            return;
++        };
++
++        self.render_bitmap_cache_entries(cache_entries, self.surface.quality());
+ 
+         self.surface.draw_commands_and_copy_to(
+             frame_output.view(),
+@@ -681,7 +730,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, BitmapError> {
+         let mut bitmap = bitmap.to_rgba();
+ 
+-        self.clamp_bitmap(&mut bitmap);
++        self.clamp_bitmap(&mut bitmap)?;
+ 
+         let extent = wgpu::Extent3d {
+             width: bitmap.width(),
+@@ -752,7 +801,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+         let texture = as_texture(handle);
+ 
+         let mut bitmap = bitmap.to_rgba();
+-        if self.clamp_bitmap(&mut bitmap) {
++        if self.clamp_bitmap(&mut bitmap)? {
+             // If we're updating a resized texture, just redo the whole thing.
+             // We can't trivially map pixel regions as we use a filter to resize.
+             region = PixelRegion::for_whole_size(bitmap.width(), bitmap.height());
+diff --git a/render/wgpu/src/surface.rs b/render/wgpu/src/surface.rs
+index 7d40e07..274fb88 100644
+--- a/render/wgpu/src/surface.rs
++++ b/render/wgpu/src/surface.rs
+@@ -44,6 +44,17 @@ impl Surface {
+         width: u32,
+         height: u32,
+         frame_buffer_format: wgpu::TextureFormat,
++    ) -> Self {
++        Self::with_sample_limit(descriptors, quality, width, height, frame_buffer_format, u32::MAX)
++    }
++
++    pub fn with_sample_limit(
++        descriptors: &Descriptors,
++        quality: StageQuality,
++        width: u32,
++        height: u32,
++        frame_buffer_format: wgpu::TextureFormat,
++        sample_limit: u32,
+     ) -> Self {
+         let size = wgpu::Extent3d {
+             width,
+@@ -53,7 +64,7 @@ impl Surface {
+ 
+         let sample_count = supported_sample_count(
+             &descriptors.adapter,
+-            quality.sample_count(),
++            quality.sample_count().min(sample_limit),
+             frame_buffer_format,
+         );
+         let pipelines = descriptors.pipelines(sample_count, frame_buffer_format);
+diff --git a/web/packages/core/src/internal/player/inner.tsx b/web/packages/core/src/internal/player/inner.tsx
+index ceaf474..18ea6c8 100644
+--- a/web/packages/core/src/internal/player/inner.tsx
++++ b/web/packages/core/src/internal/player/inner.tsx
+@@ -156,6 +156,7 @@ export class InnerPlayer {
+     private readonly unmuteOverlay: HTMLElement;
+     private readonly splashScreen: HTMLElement;
+     private readonly virtualKeyboard: HTMLInputElement;
++    private composingText = false;
+     private readonly saveManager: HTMLDivElement;
+     private readonly volumeControls: HTMLDivElement;
+     private readonly videoModal: HTMLDivElement;
+@@ -236,10 +237,39 @@ export class InnerPlayer {
+         this.virtualKeyboard = this.shadow.getElementById(
+             "virtual-keyboard",
+         )! as unknown as HTMLInputElement;
+-        this.virtualKeyboard.addEventListener(
+-            "input",
+-            this.virtualKeyboardInput.bind(this),
+-        );
++        this.virtualKeyboard.addEventListener("compositionstart", () => {
++            this.composingText = true;
++        });
++        this.virtualKeyboard.addEventListener("compositionend", (event) => {
++            const shouldCommit =
++                this.composingText && this.isVirtualKeyboardFocused();
++            this.composingText = false;
++            this.virtualKeyboard.value = "";
++            if (shouldCommit && event.data) {
++                this.instance?.commit_text(event.data);
++            }
++        });
++        this.virtualKeyboard.addEventListener("blur", () => {
++            this.composingText = false;
++            this.virtualKeyboard.value = "";
++        });
++        this.virtualKeyboard.addEventListener("input", (event) => {
++            const input = event as InputEvent;
++            if (this.composingText || input.isComposing) {
++                return;
++            }
++            const text = this.virtualKeyboard.value;
++            this.virtualKeyboard.value = "";
++            // Composition commits are handled once by compositionend.
++            if (
++                input.inputType !== "insertCompositionText" &&
++                input.inputType !== "insertFromComposition" &&
++                text &&
++                this.isVirtualKeyboardFocused()
++            ) {
++                this.instance?.commit_text(text);
++            }
++        });
+         this.saveManager = this.shadow.getElementById(
+             "save-manager",
+         )! as HTMLDivElement;
+@@ -1440,22 +1470,6 @@ export class InnerPlayer {
+         }
+     }
+ 
+-    private virtualKeyboardInput() {
+-        const input = this.virtualKeyboard;
+-        const string = input.value;
+-        for (const char of string) {
+-            for (const eventType of ["keydown", "keyup"]) {
+-                this.element.dispatchEvent(
+-                    new KeyboardEvent(eventType, {
+-                        key: char,
+-                        bubbles: true,
+-                    }),
+-                );
+-            }
+-        }
+-        input.value = "";
+-    }
+-
+     protected openVirtualKeyboard(): void {
+         // Virtual keyboard is opened/closed synchronously from core,
+         // and opening/closing it is basically dispatching
+diff --git a/web/packages/core/src/internal/ui/static-styles.css b/web/packages/core/src/internal/ui/static-styles.css
+index 2bece35..999c2e1 100644
+--- a/web/packages/core/src/internal/ui/static-styles.css
++++ b/web/packages/core/src/internal/ui/static-styles.css
+@@ -404,9 +404,11 @@
+ #virtual-keyboard {
+     position: absolute;
+     opacity: 0;
+-    top: -100px;
++    bottom: 0;
++    left: 0;
+     width: 1px;
+     height: 1px;
++    pointer-events: none;
+ }
+ 
+ .modal {
+diff --git a/web/src/builder.rs b/web/src/builder.rs
+index b1f2dc5..b3d688a 100644
+--- a/web/src/builder.rs
++++ b/web/src/builder.rs
+@@ -447,10 +447,6 @@ impl RuffleInstanceBuilder {
+                 tracing::warn!("Font source {font_name} was not recognised (not a valid SWF?)");
+             }
+         }
+-
+-        for (default, names) in &self.default_fonts {
+-            player.set_default_font(*default, names.clone());
+-        }
+     }
+ 
+     #[inline]
+@@ -575,7 +571,13 @@ impl RuffleInstanceBuilder {
+                     )
+                     .await
+                     {
+-                        Ok(renderer) => {
++                        Ok(mut renderer) => {
++                            if js_sys::Reflect::get(
++                                &js_sys::global(),
++                                &JsValue::from_str("__sjsjRetinaStageSingleSample"),
++                            ).ok().and_then(|value| value.as_bool()) == Some(true) {
++                                renderer.set_stage_sample_limit(1);
++                            }
+                             return Ok((Box::new(renderer), canvas));
+                         }
+                         Err(error) => {
+@@ -734,6 +736,9 @@ impl RuffleInstanceBuilder {
+             if matches!(self.device_font_renderer, DeviceFontRenderer::Embedded) {
+                 self.setup_fonts(&mut core);
+             }
++            for (default, names) in &self.default_fonts {
++                core.set_default_font(*default, names.clone());
++            }
+         }
+ 
+         Ok(BuiltPlayer {
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index df64fd8..9498d2f 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -6,6 +6,7 @@ mod builder;
+ mod external_interface;
+ mod input;
+ mod log_adapter;
++mod memory_diagnostics;
+ mod navigator;
+ mod storage;
+ mod ui;
+@@ -17,7 +18,7 @@ use input::{web_input_to_ruffle_key_descriptor, web_to_ruffle_text_control};
+ use js_sys::{Error as JsError, Uint8Array};
+ use ruffle_core::context::UpdateContext;
+ use ruffle_core::context_menu::ContextMenuCallback;
+-use ruffle_core::events::{GamepadButton, MouseButton, MouseWheelDelta, TextControlCode};
++use ruffle_core::events::{GamepadButton, ImeEvent, MouseButton, MouseWheelDelta, TextControlCode};
+ use ruffle_core::tag_utils::SwfMovieData;
+ use ruffle_core::{FloatDuration, Player, PlayerEvent, StaticCallstack, ViewportDimensions};
+ use ruffle_web_common::JsResult;
+@@ -121,8 +122,21 @@ struct RuffleInstance {
+     canvas_width: i32,
+     canvas_height: i32,
+     device_pixel_ratio: f64,
++    viewport_pixel_ratio_limit: f64,
+     window: Window,
+     timestamp: Option<f64>,
++    last_memory_check: f64,
++    last_cold_bitmap_check: f64,
++    last_reclaim_pages: usize,
++    previous_heap_bytes: usize,
++    last_reclaim_at: f64,
++    sliced_reclaim: bool,
++    reclaim_start: Option<(usize, usize)>,
++    reclaim_heap_baseline: usize,
++    diagnostic_hook: Option<js_sys::Function>,
++    diagnostic_skip_reclaim: bool,
++    diagnostic_last_resources: f64,
++    diagnostic_last_bitmap_classes: f64,
+     animation_handler: Option<AnimationHandler>, // requestAnimationFrame callback
+     animation_handler_id: Option<NonZeroI32>,    // requestAnimationFrame id
+     background_tick_mode: bool,
+@@ -360,6 +374,16 @@ impl RuffleHandle {
+             .unwrap_or_default()
+     }
+ 
++    pub fn commit_text(&self, text: String) {
++        let _ = self.with_instance(|instance| {
++            if instance.has_focus && instance.js_player.is_virtual_keyboard_focused() {
++                let _ = instance.with_core_mut(|core| {
++                    core.handle_event(PlayerEvent::Ime(ImeEvent::Commit(text)));
++                });
++            }
++        });
++    }
++
+     pub fn volume(&self) -> f32 {
+         self.with_core(|core| core.volume()).unwrap_or_default()
+     }
+@@ -541,6 +565,42 @@ impl RuffleHandle {
+         }
+ 
+         // Create instance.
++        let global = js_sys::global();
++        let viewport_pixel_ratio_limit =
++            js_sys::Reflect::get(&global, &JsValue::from_str("__sjsjViewportPixelRatioLimit"))
++                .ok()
++                .and_then(|value| value.as_f64())
++                .filter(|ratio| ratio.is_finite() && *ratio >= 1.0)
++                .unwrap_or(f64::INFINITY);
++        let diagnostic_hook =
++            js_sys::Reflect::get(&global, &JsValue::from_str("__sjsjFrameDiagnostic"))
++                .ok()
++                .and_then(|value| value.dyn_into::<js_sys::Function>().ok());
++        let diagnostic_skip_reclaim = diagnostic_hook.is_some()
++            && js_sys::Reflect::get(&global, &JsValue::from_str("__sjsjSkipReclaim"))
++                .ok()
++                .and_then(|value| value.as_bool())
++                .unwrap_or(false);
++        let earlier_gc =
++            js_sys::Reflect::get(&global, &JsValue::from_str("__sjsjEarlierGc"))
++                .ok()
++                .and_then(|value| value.as_bool())
++                .unwrap_or(false);
++        if earlier_gc {
++            player
++                .core
++                .lock()
++                .expect("new player is unlocked")
++                .use_earlier_incremental_collection();
++        }
++        if let Some(hook) = &diagnostic_hook {
++            let _ = hook.call2(
++                &JsValue::UNDEFINED,
++                &JsValue::from(0),
++                player.canvas.as_ref(),
++            );
++        }
++
+         let instance = RuffleInstance {
+             core: player.core,
+             callstack,
+@@ -548,7 +608,8 @@ impl RuffleHandle {
+             canvas: player.canvas.clone(),
+             canvas_width: 0, // Initialize canvas width and height to 0 to force an initial canvas resize.
+             canvas_height: 0,
+-            device_pixel_ratio: window.device_pixel_ratio(),
++            device_pixel_ratio: window.device_pixel_ratio().min(viewport_pixel_ratio_limit),
++            viewport_pixel_ratio_limit,
+             window: window.clone(),
+             animation_handler: None,
+             animation_handler_id: None,
+@@ -569,6 +630,19 @@ impl RuffleHandle {
+             focus_on_press_callback: None,
+             webglcontextlost_callback: None,
+             timestamp: None,
++            last_memory_check: 0.0,
++            last_cold_bitmap_check: 0.0,
++            last_reclaim_pages: 0,
++            previous_heap_bytes: 0,
++            last_reclaim_at: 0.0,
++            sliced_reclaim: js_sys::Reflect::get(&global, &JsValue::from_str("__sjsjSlicedReclaim"))
++                .ok().and_then(|value| value.as_bool()) == Some(true),
++            reclaim_start: None,
++            reclaim_heap_baseline: 0,
++            diagnostic_hook,
++            diagnostic_skip_reclaim,
++            diagnostic_last_resources: 0.0,
++            diagnostic_last_bitmap_classes: 0.0,
+             has_focus: false,
+             trace_observer: player.trace_observer,
+             log_subscriber,
+@@ -772,7 +846,13 @@ impl RuffleHandle {
+                 move |js_event: KeyboardEvent| {
+                     let _ = ruffle.with_instance(|instance| {
+                         if instance.has_focus {
+-                            let mut paste_event = false;
++                            let editing = instance.js_player.is_virtual_keyboard_focused();
++                            // WebKit can report 229 for the key starting or committing IME,
++                            // even when isComposing is false.
++                            if editing && (js_event.is_composing() || js_event.key_code() == 229) {
++                                return;
++                            }
++                            let mut allow_default = false;
+                             let _ = instance.with_core_mut(|core| {
+                                 let key = web_input_to_ruffle_key_descriptor(&js_event);
+                                 let is_ctrl_cmd = js_event.ctrl_key() || js_event.meta_key();
+@@ -784,21 +864,26 @@ impl RuffleHandle {
+                                     is_ctrl_cmd,
+                                     js_event.shift_key(),
+                                 ) {
+-                                    paste_event = control_code == TextControlCode::Paste;
++                                    allow_default = control_code == TextControlCode::Paste;
+                                     // The JS paste event fires separately and the clipboard text is not available until then,
+                                     // so we need to wait before handling it
+-                                    if !paste_event {
++                                    if !allow_default {
+                                         core.handle_event(PlayerEvent::TextControl {
+                                             code: control_code,
+                                         });
+                                     }
++                                } else if editing {
++                                    // Let the browser handle printable keys and dead keys in
++                                    // the native input. Its input event delivers the text.
++                                    allow_default = !is_ctrl_cmd
++                                        && (key.logical_key.character().is_some()
++                                            || matches!(js_event.key().as_str(), "Dead" | "Process"));
+                                 } else if let Some(codepoint) = key.logical_key.character() {
+                                     core.handle_event(PlayerEvent::TextInput { codepoint });
+                                 }
+                             });
+ 
+-                            // Don't prevent the JS paste event from firing
+-                            if !paste_event {
++                            if !allow_default {
+                                 js_event.prevent_default();
+                             }
+                         }
+@@ -841,6 +926,11 @@ impl RuffleHandle {
+                 move |js_event: KeyboardEvent| {
+                     let _ = ruffle.with_instance(|instance| {
+                         if instance.has_focus {
++                            if instance.js_player.is_virtual_keyboard_focused()
++                                && (js_event.is_composing() || js_event.key_code() == 229)
++                            {
++                                return;
++                            }
+                             let _ = instance.with_core_mut(|core| {
+                                 let key = web_input_to_ruffle_key_descriptor(&js_event);
+                                 core.handle_event(PlayerEvent::KeyUp { key });
+@@ -1122,12 +1212,22 @@ impl RuffleHandle {
+     fn tick(self, timestamp: f64) {
+         let mut dt = 0.0;
+         let mut new_dimensions = None;
++        let mut reclaim = false;
++        let mut pending_reclaim = None;
++        let mut sliced_reclaim = false;
++        let mut diagnostic = None;
++        let mut sample_resources = false;
++        let mut sample_bitmap_classes = false;
++        let mut try_pack_bitmap = false;
++        let mut heap_growth = 0;
+         let mut gamepad_button_events = Vec::new();
+         let _ = self.with_instance_mut(|instance| {
+             // Check for canvas resize.
+             let canvas_width = instance.canvas.client_width();
+             let canvas_height = instance.canvas.client_height();
+-            let device_pixel_ratio = instance.window.device_pixel_ratio(); // Changes via user zooming.
++            // Use the same effective ratio for the viewport and pointer coordinates.
++            let device_pixel_ratio = instance.window.device_pixel_ratio()
++                .min(instance.viewport_pixel_ratio_limit);
+             if instance.canvas_width != canvas_width
+                 || instance.canvas_height != canvas_height
+                 || (instance.device_pixel_ratio - device_pixel_ratio).abs() >= f64::EPSILON
+@@ -1222,8 +1322,69 @@ impl RuffleHandle {
+ 
+             // Store the timestamp of the last tick.
+             instance.timestamp = Some(timestamp);
++            if !instance.diagnostic_skip_reclaim
++                && !instance.background_tick_mode
++                && timestamp - instance.last_cold_bitmap_check >= 250.0
++            {
++                instance.last_cold_bitmap_check = timestamp;
++                try_pack_bitmap = true;
++            }
++
++            if !instance.diagnostic_skip_reclaim {
++                let heap = memory_diagnostics::allocated_bytes();
++                if heap >= 256 * 1024 * 1024 && instance.previous_heap_bytes != 0 {
++                    heap_growth = heap.saturating_sub(instance.previous_heap_bytes);
++                }
++                instance.previous_heap_bytes = heap;
++            }
++
++            sliced_reclaim = instance.sliced_reclaim;
++            pending_reclaim = instance.reclaim_start;
++
++            // Check both committed pages and live allocations. Near the address-space
++            // ceiling, a failed allocation can arrive before the next page-growth trigger.
++            diagnostic = instance.diagnostic_hook.clone();
++            if diagnostic.is_some() && timestamp - instance.diagnostic_last_resources >= 2_000.0 {
++                sample_resources = true;
++                instance.diagnostic_last_resources = timestamp;
++                if timestamp - instance.diagnostic_last_bitmap_classes >= 10_000.0 {
++                    sample_bitmap_classes = true;
++                    instance.diagnostic_last_bitmap_classes = timestamp;
++                }
++            }
++            if !instance.diagnostic_skip_reclaim
++                && pending_reclaim.is_none()
++                && timestamp - instance.last_memory_check >= 2_000.0
++            {
++                instance.last_memory_check = timestamp;
++                let pages = core::arch::wasm32::memory_size(0);
++                const START_PAGES: usize = 16_384; // 1 GiB
++                const STEP_PAGES: usize = 2_048; // 128 MiB
++                let heap = instance.previous_heap_bytes;
++                const HIGH_HEAP_BYTES: usize = 3 * 1024 * 1024 * 1024;
++                const RECLAIM_GROWTH_BYTES: usize = 128 * 1024 * 1024;
++                const MIN_HEAP_RECLAIM_INTERVAL_MS: f64 = 10_000.0;
++                let page_growth = pages >= START_PAGES
++                    && pages.saturating_sub(instance.last_reclaim_pages) >= STEP_PAGES;
++                let heap_pressure = heap >= HIGH_HEAP_BYTES
++                    && heap.saturating_sub(instance.reclaim_heap_baseline) >= RECLAIM_GROWTH_BYTES
++                    && timestamp - instance.last_reclaim_at >= MIN_HEAP_RECLAIM_INTERVAL_MS;
++                reclaim = page_growth || heap_pressure;
++            }
+         });
+ 
++        let mark = |phase: u32, first: u32, second: u32| {
++            if let Some(hook) = &diagnostic {
++                let _ = hook.call3(
++                    &JsValue::UNDEFINED,
++                    &JsValue::from(phase),
++                    &JsValue::from(first),
++                    &JsValue::from(second),
++                );
++            }
++        };
++        mark(1, 0, 0);
++
+         // Tick the Ruffle core.
+         let _ = self.with_core_mut(|core| {
+             for event in gamepad_button_events {
+@@ -1243,11 +1404,96 @@ impl RuffleHandle {
+                 });
+             }
+ 
++            let reclaiming = reclaim || pending_reclaim.is_some();
++            if reclaiming {
++                let heap_now = memory_diagnostics::allocated_bytes();
++                let bitmap_now = ruffle_core::bitmap::bitmap_data::bitmap_pixel_bytes();
++                let started = pending_reclaim.unwrap_or((heap_now, bitmap_now));
++                mark(2, heap_now as u32, bitmap_now as u32);
++                // Retain the old synchronous path close to the wasm32 limit.
++                const EMERGENCY_HEAP: usize = 3_840 * 1024 * 1024;
++                let finished = if sliced_reclaim && heap_now < EMERGENCY_HEAP {
++                    core.reclaim_memory_slice()
++                } else {
++                    core.reclaim_unused_memory();
++                    true
++                };
++                if finished {
++                    let heap_after = memory_diagnostics::allocated_bytes();
++                    let bitmap_after = ruffle_core::bitmap::bitmap_data::bitmap_pixel_bytes();
++                    mark(7, heap_after as u32, bitmap_after as u32);
++                    let _ = self.with_instance_mut(|instance| {
++                        instance.reclaim_start = None;
++                        instance.last_reclaim_pages = core::arch::wasm32::memory_size(0);
++                        instance.last_reclaim_at = timestamp;
++                        instance.reclaim_heap_baseline = if started.0.saturating_sub(heap_after)
++                            >= 32 * 1024 * 1024
++                        {
++                            heap_after
++                        } else {
++                            started.0
++                        };
++                    });
++                } else {
++                    mark(18, 0, 0);
++                    let _ = self.with_instance_mut(|instance| {
++                        instance.reclaim_start = Some(started);
++                    });
++                }
++            }
++            let pack_this_tick = try_pack_bitmap && !reclaiming;
++            if pack_this_tick {
++                mark(16, 0, 0);
++            }
++            core.pack_idle_bitmap((timestamp / 1_000.0) as usize, pack_this_tick);
++            if pack_this_tick {
++                mark(17, 0, 0);
++            }
++            if !reclaiming {
++                core.collect_for_heap_growth(heap_growth);
++            }
++            mark(8, 0, 0);
+             core.tick(FloatDuration::from_millis(dt));
++            if diagnostic.is_some() {
++                mark(
++                    3,
++                    core.frame_diagnostics().0,
++                    u32::from(core.current_frame().unwrap_or(0)),
++                );
++            }
+ 
+             // Render if the core signals a new frame, or if we resized.
+             if core.needs_render() || new_dimensions.is_some() {
++                mark(4, 0, 0);
+                 core.render();
++                if diagnostic.is_some() {
++                    mark(5, core.frame_diagnostics().1, 0);
++                }
++            }
++            if sample_resources {
++                let (objects, libraries, swf_bytes) = core.resource_diagnostics();
++                mark(6, objects as u32, libraries as u32);
++                mark(10, memory_diagnostics::allocated_bytes() as u32, swf_bytes as u32);
++                let [generated, embedded, supplied, copy_on_write] =
++                    ruffle_core::bitmap::bitmap_data::bitmap_pixel_bytes_by_origin();
++                mark(11, (generated + embedded + supplied + copy_on_write) as u32, 0);
++                mark(13, generated as u32, embedded as u32);
++                mark(14, supplied as u32, copy_on_write as u32);
++                let (disposed, freed_mib) =
++                    ruffle_core::bitmap::bitmap_data::bitmap_disposal_diagnostics();
++                mark(12, disposed as u32, freed_mib as u32);
++                if sample_bitmap_classes && let Some(hook) = &diagnostic {
++                    let report = ruffle_core::bitmap::bitmap_data::embedded_bitmap_class_summary();
++                    let _ = hook.call3(
++                        &JsValue::UNDEFINED,
++                        &JsValue::from(15),
++                        &JsValue::from_str(&report),
++                        &JsValue::UNDEFINED,
++                    );
++                }
++            }
++            if diagnostic.is_some() {
++                mark(9, u32::from(core.is_playing()), 0);
+             }
+         });
+     }
+diff --git a/web/src/navigator.rs b/web/src/navigator.rs
+index 8438d17..7f8fb42 100644
+--- a/web/src/navigator.rs
++++ b/web/src/navigator.rs
+@@ -17,8 +17,10 @@ use ruffle_core::socket::{ConnectionState, SocketAction, SocketHandle};
+ use ruffle_core::swf::Encoding;
+ use std::borrow::Cow;
+ use std::cell::RefCell;
++use std::pin::Pin;
+ use std::rc::Rc;
+ use std::sync::{Arc, Mutex, Weak};
++use std::task::{Poll, ready};
+ use std::time::Duration;
+ use tracing_subscriber::Registry;
+ use tracing_subscriber::layer::Layered;
+@@ -443,40 +445,51 @@ impl NavigatorBackend for WebNavigatorBackend {
+         }
+     }
+ 
+-    fn spawn_future(&mut self, future: OwnedFuture<(), Error>) {
++    fn spawn_future(&mut self, mut future: OwnedFuture<(), Error>) {
+         let subscriber = self.log_subscriber.clone();
+         let player = self.player.clone();
+ 
+-        spawn_local(async move {
++        let mut retry: Option<JsFuture> = None;
++        spawn_local(future::poll_fn(move |cx| {
+             let _subscriber = tracing::subscriber::set_default(subscriber.clone());
+-            if player
+-                .upgrade()
+-                .expect("Called spawn_future after player was dropped")
+-                .try_lock()
+-                .is_err()
+-            {
+-                // The player is locked - this can occur due to 'wasm-bindgen-futures' using
+-                // 'queueMicroTask', which may result in one of our future's getting polled
+-                // while we're still inside of our 'requestAnimationFrame' callback (e.g.
+-                // when we call into javascript).
+-                //
+-                // When this happens, we 'reschedule' this future by waiting for a 'setTimeout'
+-                // callback to be resolved. This will cause our future to get woken up from
+-                // inside the 'setTimeout' JavaScript task (which is a new top-level call stack),
+-                // outside of the 'requestAnimationFrame' callback, which will allow us to lock
+-                // the Player.
+-                let promise = Promise::new(&mut |resolve, _reject| {
+-                    web_sys::window()
+-                        .expect("window")
+-                        .set_timeout_with_callback(&resolve)
+-                        .expect("Failed to call setTimeout with dummy promise");
+-                });
+-                let _ = JsFuture::from(promise).await;
++            // Check every poll, including when a fetch or stream resumes. In WebKit
++            // a microtask can run before the outer WASM callback releases the Player.
++            let Some(core) = player.upgrade() else {
++                return Poll::Ready(());
++            };
++            let locked = core.try_lock().is_err();
++            drop(core);
++
++            if let Some(wait) = retry.as_mut() {
++                if ready!(Pin::new(wait).poll(cx)).is_err() {
++                    tracing::error!("Unable to defer a web navigator task");
++                    return Poll::Ready(());
++                }
++                retry = None;
++            }
++            if locked {
++                let mut wait = JsFuture::from(Promise::new(&mut |resolve, reject| {
++                    let result =
++                        window().and_then(|window| window.set_timeout_with_callback(&resolve).ok());
++                    if result.is_none() {
++                        let _ = reject.call0(&JsValue::UNDEFINED);
++                    }
++                }));
++                match Pin::new(&mut wait).poll(cx) {
++                    Poll::Pending => retry = Some(wait),
++                    Poll::Ready(Ok(_)) => cx.waker().wake_by_ref(),
++                    Poll::Ready(Err(_)) => {
++                        tracing::error!("Unable to defer a web navigator task");
++                        return Poll::Ready(());
++                    }
++                }
++                return Poll::Pending;
+             }
+-            if let Err(e) = future.await {
++            if let Err(e) = ready!(future.as_mut().poll(cx)) {
+                 tracing::error!("Asynchronous error occurred: {}", e);
+             }
+-        })
++            Poll::Ready(())
++        }));
+     }
+ 
+     fn pre_process_url(&self, mut url: Url) -> Url {
+diff --git a/web/src/ui/canvas_font_renderer.rs b/web/src/ui/canvas_font_renderer.rs
+index f4b1229..9e5c0e4 100644
+--- a/web/src/ui/canvas_font_renderer.rs
++++ b/web/src/ui/canvas_font_renderer.rs
+@@ -137,7 +137,13 @@ impl CanvasFontRenderer {
+         let image_data = self.ctx.get_image_data(0, 0, bitmap_width, bitmap_height)?;
+         let width = image_data.width();
+         let height = image_data.height();
+-        let pixels = image_data.data().0;
++        let mut pixels = image_data.data().0;
++        // Canvas returns straight alpha. The glyph is white and the atlas
++        // expects premultiplied RGBA, so each color channel equals coverage.
++        for pixel in pixels.as_chunks_mut::<4>().0 {
++            let alpha = pixel[3];
++            *pixel = [alpha; 4];
++        }
+ 
+         let bitmap = Bitmap::new(width, height, BitmapFormat::Rgba, pixels);
+         let bitmap_tx = Twips::from_pixels(bitmap_tx);

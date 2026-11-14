@@ -1,0 +1,106 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><style>html,body{width:100%;height:100%;margin:0;background:#000;overflow:hidden}#game{position:absolute;left:50%;top:50%;width:min(100vw,calc(100vh * 25 / 14));aspect-ratio:25 / 14;transform:translate(-50%,-50%)}ruffle-player{display:block;width:100%;height:100%}#status{position:absolute;left:12px;top:10px;color:white;font:14px sans-serif}</style><div id="game"></div><div id="status">正在连接游戏资源…</div>
+<script>
+const sessionId=location.pathname.split('/')[2];
+// Record WebAssembly capacity locally, including during the initial movie load.
+let playerMemory;
+const wasmInitializers = new Map();
+for (const name of ['instantiate', 'instantiateStreaming']) {
+    const original = WebAssembly[name];
+    if (typeof original !== 'function') continue;
+    wasmInitializers.set(name, original);
+    WebAssembly[name] = async function (...args) {
+        const result = await original.apply(this, args);
+        const instance = result.instance ?? result;
+        const memory = instance.exports.memory;
+        if (!playerMemory && memory instanceof WebAssembly.Memory) {
+            playerMemory = memory;
+            for (const [method, implementation] of wasmInitializers) {
+                WebAssembly[method] = implementation;
+            }
+            const sample = () => {
+                fetch('/report/' + sessionId, {
+                    method: 'POST',
+                    body: 'wasm-memory ' + playerMemory.buffer.byteLength,
+                }).catch(() => {});
+            };
+            sample();
+            setInterval(sample, 10000);
+        }
+        return result;
+    };
+}
+let reports=0,reportWindow=0;const criticalSeen=new Set();
+const coreLockError = "Unable to lock Ruffle core";
+const report=(m,critical=false)=>{m=String(m);const now=performance.now();if(now-reportWindow>=1000){reports=0;reportWindow=now;}if(critical){if(criticalSeen.has(m)||criticalSeen.size>=32)return;criticalSeen.add(m);m='critical: '+m;}else if(++reports>12||m.includes('log.catearsgame.com'))return;setTimeout(()=>fetch('/report/'+sessionId,{method:'POST',body:m.slice(0,48000)}).catch(()=>{}),0);};
+const detail=(value)=>value&&typeof value.stack==='string'?value.stack:String(value);
+for(const level of ['error','warn','log','info']){const original=console[level];console[level]=function(...args){original.apply(console,args);const text=args.map(detail).join(' ');if(text.includes(coreLockError)){report(coreLockError,true);return;}const critical=/panicked|cannot recursively|already borrowed|unreachable|out of memory|RuntimeError|wgpu Validation Error|Dimension [XYZ] is zero|WebGL context lost/i.test(text);if(critical||level==='error'||level==='warn'||/ERROR|WARN|not implemented|SJSJ_RENDERER/i.test(text))report(level+': '+text,critical);};}
+window.addEventListener('error',e=>report('window error: '+e.message+'\n'+detail(e.error),true));
+window.addEventListener('unhandledrejection',e=>report('unhandled rejection: '+detail(e.reason),true));
+window.BehaviacSjsj=()=>{};
+window.gotoLogin=()=>{window.webkit?.messageHandlers?.login?.postMessage('login');};
+window.ShowRecharge=()=>{window.webkit?.messageHandlers?.recharge?.postMessage(null);};
+// Ruffle's canvas renderer requests the SWF's Windows family by name.
+const macFontAliases = new Map([
+    ["simsun", "Songti SC"], ["nsimsun", "Songti SC"], ["宋体", "Songti SC"],
+    ["simhei", "Heiti SC"], ["黑体", "Heiti SC"],
+    ["microsoft yahei", "PingFang SC"], ["微软雅黑", "PingFang SC"],
+    ["microsoft yahei light", "PingFang SC Light"],
+]);
+const fontContext = window.OffscreenCanvasRenderingContext2D?.prototype;
+const fontProperty = fontContext && Object.getOwnPropertyDescriptor(fontContext, "font");
+if (fontProperty?.configurable && fontProperty.set) {
+    Object.defineProperty(fontContext, "font", {
+        ...fontProperty,
+        set(value) {
+            if (typeof value === "string") {
+                value = value.replace(/^(.*\b64px\s+)"([^"]+)"$/, (original, prefix, family) => {
+                    const alias = macFontAliases.get(family.toLowerCase());
+                    return alias ? `${prefix}"${alias}"` : original;
+                });
+            }
+            fontProperty.set.call(this, value);
+        },
+    });
+}
+// Give glyph rasterization a transparent pixel on each side. The renderer
+// compensates the origin using these same bounds, so text layout is unchanged.
+if (fontContext) {
+    const measureText = fontContext.measureText;
+    const inkEdges = new Set([
+        "actualBoundingBoxLeft", "actualBoundingBoxRight",
+        "actualBoundingBoxAscent", "actualBoundingBoxDescent",
+    ]);
+    fontContext.measureText = function(text) {
+        const metrics = measureText.call(this, text);
+        if (!/\b64px\s/.test(this.font)
+            || metrics.actualBoundingBoxLeft + metrics.actualBoundingBoxRight <= 0
+            || metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent <= 0) {
+            return metrics;
+        }
+        return new Proxy(metrics, {
+            get(target, key) {
+                const value = Reflect.get(target, key, target);
+                return inkEdges.has(key) ? value + 1 : value;
+            },
+        });
+    };
+}
+const defaultFonts = {
+    sans: ["Helvetica"],
+    serif: ["Times"],
+    typewriter: ["Menlo"],
+    japaneseGothic: ["Hiragino Sans"],
+    japaneseGothicMono: ["Osaka-Mono"],
+    japaneseMincho: ["Hiragino Mincho ProN"],
+};
+window.RufflePlayer={config:{defaultFonts,autoplay:'on',preferredRenderer:'wgpu-webgl',allowScriptAccess:true,publicPath:'/runtime/',upgradeToHttps:false,deviceFontRenderer:'canvas',logLevel:'error'}};
+</script><script src="/runtime/ruffle.js"></script><script>
+(async()=>{
+const config=await(await fetch('/config/'+sessionId)).json();
+const proxy=location.origin+'/proxy/'+sessionId;
+const player=window.RufflePlayer.newest().createPlayer();player.id='Loading';player.setAttribute('name','Loading');document.querySelector('#game').append(player);
+const sockets=config.sockets.map(([host,port])=>({host,port,proxyUrl:'ws://'+location.host+'/socket/'+sessionId+'?host='+encodeURIComponent(host)+'&port='+port}));
+await player.ruffle().load({url:config.movie,base:config.base,parameters:config.parameters,allowScriptAccess:true,preferredRenderer:'wgpu-webgl',scale:'showAll',forceScale:true,deviceFontRenderer:'canvas',socketProxy:sockets,urlRewriteRules:[[/^(https?):\/\/([^/]+)(\/.*)?$/i,proxy+'/$1/$2$3']]});
+document.querySelector('#status').remove();report('player_loaded');
+})().catch(e=>{document.querySelector('#status').textContent='加载失败：'+e;report(String(e));});
+</script></html>
